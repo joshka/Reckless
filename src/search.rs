@@ -56,6 +56,7 @@ pub fn start(td: &mut ThreadData, report: Report, thread_count: usize) {
     td.completed_depth = 0;
 
     td.pv_table.clear(0);
+    td.previous_pv.clear();
     td.nnue.full_refresh(&td.board);
 
     td.root_moves = td.board.generate_all_moves().iter().map(|v| RootMove { mv: v.mv, ..Default::default() }).collect();
@@ -180,6 +181,8 @@ pub fn start(td: &mut ThreadData, report: Report, thread_count: usize) {
 
         if td.shared.status.get() != Status::STOPPED {
             td.completed_depth = depth;
+            td.previous_pv.clear();
+            td.previous_pv.extend_from_slice(td.root_moves[0].pv.line());
         }
 
         if report == Report::Full
@@ -272,6 +275,12 @@ fn search<NODE: NodeType>(
     let stm = td.board.side_to_move();
     let in_check = td.board.in_check();
     let excluded = td.stack[ply].excluded.is_present();
+    let on_previous_pv = NODE::ROOT
+        || (td.stack[ply - 1].on_previous_pv
+            && (ply as usize - 1) < td.previous_pv.len()
+            && td.stack[ply - 1].mv == td.previous_pv[ply as usize - 1]);
+
+    td.stack[ply].on_previous_pv = on_previous_pv;
 
     if !NODE::ROOT && NODE::PV {
         td.pv_table.clear(ply as usize);
@@ -726,6 +735,7 @@ fn search<NODE: NodeType>(
             if !in_check
                 && !td.board.is_direct_check(mv)
                 && is_quiet
+                && (!NODE::PV || !on_previous_pv)
                 && move_count >= (3006 + 70 * improvement / 16 + 1455 * depth * depth + 68 * history / 1024) / 1024
             {
                 skip_quiets = true;
@@ -735,7 +745,13 @@ fn search<NODE: NodeType>(
             // Futility Pruning (FP)
             let futility_value = eval + 79 * depth + 64 * history / 1024 + 84 * (eval >= beta) as i32 - 115;
 
-            if !in_check && is_quiet && depth < 15 && futility_value <= alpha && !td.board.is_direct_check(mv) {
+            if !in_check
+                && is_quiet
+                && (!NODE::PV || !on_previous_pv)
+                && depth < 15
+                && futility_value <= alpha
+                && !td.board.is_direct_check(mv)
+            {
                 if !is_decisive(best_score) && best_score < futility_value {
                     best_score = futility_value;
                 }
