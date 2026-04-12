@@ -56,6 +56,7 @@ pub fn start(td: &mut ThreadData, report: Report, thread_count: usize) {
     td.completed_depth = 0;
 
     td.pv_table.clear(0);
+    td.previous_pv.clear();
     td.nnue.full_refresh(&td.board);
 
     td.root_moves = td.board.generate_all_moves().iter().map(|v| RootMove { mv: v.mv, ..Default::default() }).collect();
@@ -180,6 +181,8 @@ pub fn start(td: &mut ThreadData, report: Report, thread_count: usize) {
 
         if td.shared.status.get() != Status::STOPPED {
             td.completed_depth = depth;
+            td.previous_pv.clear();
+            td.previous_pv.extend_from_slice(td.root_moves[0].pv.line());
         }
 
         if report == Report::Full
@@ -272,6 +275,12 @@ fn search<NODE: NodeType>(
     let stm = td.board.side_to_move();
     let in_check = td.board.in_check();
     let excluded = td.stack[ply].excluded.is_present();
+    let on_previous_pv = NODE::ROOT
+        || (td.stack[ply - 1].on_previous_pv
+            && (ply as usize - 1) < td.previous_pv.len()
+            && td.stack[ply - 1].mv == td.previous_pv[ply as usize - 1]);
+
+    td.stack[ply].on_previous_pv = on_previous_pv;
 
     if !NODE::ROOT && NODE::PV {
         td.pv_table.clear(ply as usize);
@@ -585,6 +594,11 @@ fn search<NODE: NodeType>(
                 return score;
             }
         }
+    }
+
+    // Internal Iterative Reduction (IIR)
+    if !NODE::ROOT && !in_check && !excluded && !on_previous_pv && depth >= 6 && tt_move.is_null() {
+        depth -= 1;
     }
 
     // ProbCut
