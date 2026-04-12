@@ -587,6 +587,11 @@ fn search<NODE: NodeType>(
         }
     }
 
+    // Internal Iterative Reduction (IIR)
+    if !NODE::ROOT && !in_check && !excluded && depth >= 6 && tt_move.is_null() {
+        depth -= 1;
+    }
+
     // ProbCut
     let mut probcut_beta = beta + 270 - 75 * improving as i32;
 
