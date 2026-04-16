@@ -27,3 +27,4 @@ bindgen = "0.71.1"
 
 [dependencies]
 libc = "0.2.175"
+zerocopy = { version = "0.8.48", features = ["derive"] }

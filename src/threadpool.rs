@@ -147,15 +147,22 @@ impl WorkerThread {
 // and a receiver for receiving messages from the worker thread.
 struct WorkSender {
     // INVARIANT: Each send must be matched by a receive.
-    sender: SyncSender<Box<dyn FnOnce() + Send>>,
+    sender: SyncSender<WorkItem>,
     completion_signal: Arc<(Mutex<bool>, Condvar)>,
 }
 
 /// Handle for the receiver side of a worker thread.
 struct WorkReceiver {
-    receiver: Receiver<Box<dyn FnOnce() + Send>>,
+    receiver: Receiver<WorkItem>,
     completion_signal: Arc<(Mutex<bool>, Condvar)>,
 }
+
+struct WorkItem {
+    run: unsafe fn(*mut ()),
+    data: *mut (),
+}
+
+unsafe impl Send for WorkItem {}
 
 fn make_work_channel() -> (WorkSender, WorkReceiver) {
     let (sender, receiver) = std::sync::mpsc::sync_channel(0);
@@ -202,9 +209,15 @@ impl<'scope, 'env> ScopeExt<'scope, 'env> for Scope<'scope, 'env> {
     where
         F: FnOnce() + Send + 'scope,
     {
-        // Safety: This file is structured such that threads never hold the data longer than is permissible.
-        let f = unsafe {
-            std::mem::transmute::<Box<dyn FnOnce() + Send + 'scope>, Box<dyn FnOnce() + Send + 'static>>(Box::new(f))
+        unsafe fn run_scoped<F: FnOnce()>(data: *mut ()) {
+            let boxed = unsafe { Box::from_raw(data.cast::<F>()) };
+            boxed();
+        }
+
+        // Safety: The scoped handle guarantees the task is joined before borrowed data can expire.
+        let task = WorkItem {
+            run: run_scoped::<F>,
+            data: Box::into_raw(Box::new(f)).cast(),
         };
 
         // Reset the completion flag before sending the task
@@ -214,7 +227,10 @@ impl<'scope, 'env> ScopeExt<'scope, 'env> for Scope<'scope, 'env> {
             *completed = false;
         }
 
-        thread.comms.sender.send(f).expect("Failed to send function to worker thread");
+        if let Err(err) = thread.comms.sender.send(task) {
+            drop(unsafe { Box::from_raw(err.0.data.cast::<F>()) });
+            panic!("Failed to send function to worker thread");
+        }
 
         ReceiverHandle {
             completion_signal: &thread.comms.completion_signal,
@@ -236,7 +252,7 @@ fn make_worker_thread(id: Option<usize>) -> WorkerThread {
         let _ = id;
 
         while let Ok(work) = receiver.receiver.recv() {
-            work();
+            unsafe { (work.run)(work.data) };
             let (lock, cvar) = &*receiver.completion_signal;
             let mut completed = lock.lock().unwrap();
             *completed = true;

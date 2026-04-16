@@ -1,5 +1,7 @@
 use std::arch::x86_64::*;
 
+use zerocopy::TryFromBytes;
+
 use super::{PIECE_TO_BIT_TABLE, RAY_ATTACKERS_MASK, RAY_ATTACKS_MASK, RAY_PERMUTATIONS, RAY_SLIDERS_MASK};
 use crate::{
     nnue::accumulator::threats::{ThreatAccumulator, ThreatDelta},
@@ -119,8 +121,10 @@ pub fn splat_threats(
     accum: &mut ThreatAccumulator, pboard: [__m256i; 2], perm: [__m256i; 2], mut attacked: u64, mut attackers: u64,
     focus_piece: Piece, focus_sq: Square, add: bool,
 ) {
-    let pieces = unsafe { std::mem::transmute::<[__m256i; 2], [Piece; 64]>(pboard) };
-    let squares = unsafe { std::mem::transmute::<[__m256i; 2], [Square; 64]>(perm) };
+    let pieces: &[Piece; 64] =
+        zerocopy::try_transmute_ref!(&pboard).expect("ray permutation produced invalid piece bytes");
+    let squares: &[Square; 64] =
+        zerocopy::try_transmute_ref!(&perm).expect("ray permutation produced invalid square bytes");
 
     while attacked != 0 {
         let i = attacked.trailing_zeros() as usize;
@@ -147,8 +151,10 @@ pub fn splat_xray_threats(
 ) {
     debug_assert_eq!(sliders.count_ones(), victims.count_ones());
 
-    let pieces = unsafe { std::mem::transmute::<[__m256i; 2], [Piece; 64]>(pboard) };
-    let squares = unsafe { std::mem::transmute::<[__m256i; 2], [Square; 64]>(perm) };
+    let pieces: &[Piece; 64] =
+        zerocopy::try_transmute_ref!(&pboard).expect("ray permutation produced invalid piece bytes");
+    let squares: &[Square; 64] =
+        zerocopy::try_transmute_ref!(&perm).expect("ray permutation produced invalid square bytes");
 
     while sliders != 0 {
         let slider = sliders.trailing_zeros() as usize;
