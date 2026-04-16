@@ -290,6 +290,37 @@ impl SearchSnapshot {
 }
 
 #[derive(Clone)]
+pub struct HelperSearchResult {
+    pub time_manager: TimeManager,
+    pub completed_depth: i32,
+    pub root_in_tb: bool,
+    pub best_move: RootMove,
+}
+
+impl HelperSearchResult {
+    pub fn from(td: &ThreadData) -> Self {
+        Self {
+            time_manager: td.time_manager.clone(),
+            completed_depth: td.completed_depth,
+            root_in_tb: td.root_in_tb,
+            best_move: td.root_moves[0].clone(),
+        }
+    }
+
+    pub fn print_uci_info(&self, shared: &SharedContext, board: &Board) {
+        let snapshot = SearchSnapshot {
+            time_manager: self.time_manager.clone(),
+            root_moves: vec![self.best_move.clone()],
+            completed_depth: self.completed_depth,
+            multi_pv: 1,
+            root_in_tb: self.root_in_tb,
+        };
+
+        snapshot.print_uci_info(shared, board, self.completed_depth);
+    }
+}
+
+#[derive(Clone)]
 pub struct RootMove {
     pub mv: Move,
     pub score: i32,

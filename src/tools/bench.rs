@@ -13,7 +13,7 @@ use crate::{
     board::Board,
     search::Report,
     thread::SharedContext,
-    threadpool::ThreadPool,
+    threadpool::{SearchRequest, ThreadPool},
     time::{Limits, TimeManager},
 };
 
@@ -104,7 +104,16 @@ pub fn bench<const PRETTY: bool>(args: &[&str]) {
 
         pool.set_board(board);
 
-        pool.execute_searches(time_manager, Report::None, &shared);
+        let _ = pool.execute_searches(
+            SearchRequest {
+                board: Arc::new(pool.board().clone()),
+                time_manager,
+                report: Report::None,
+                thread_count: pool.len(),
+                multi_pv: 1,
+            },
+            &shared,
+        );
 
         nodes += shared.nodes.aggregate();
 

@@ -9,9 +9,23 @@ use std::{
 use crate::{
     board::Board,
     search::{self, Report},
-    thread::{SearchSnapshot, SharedContext, Status, ThreadData},
+    thread::{HelperSearchResult, SearchSnapshot, SharedContext, Status, ThreadData},
     time::TimeManager,
 };
+
+#[derive(Clone)]
+pub struct SearchRequest {
+    pub board: Arc<Board>,
+    pub time_manager: TimeManager,
+    pub report: Report,
+    pub thread_count: usize,
+    pub multi_pv: usize,
+}
+
+pub struct SearchResults {
+    pub main: SearchSnapshot,
+    pub helpers: Vec<HelperSearchResult>,
+}
 
 pub struct ThreadPool {
     main: ThreadData,
@@ -72,12 +86,7 @@ impl ThreadPool {
         self.workers = make_worker_threads(threads, shared, board);
     }
 
-    pub fn execute_searches(
-        &mut self,
-        time_manager: TimeManager,
-        report: Report,
-        shared: &Arc<SharedContext>,
-    ) -> Vec<SearchSnapshot> {
+    pub fn execute_searches(&mut self, request: SearchRequest, shared: &Arc<SharedContext>) -> SearchResults {
         shared.tt.increment_age();
 
         shared.nodes.reset();
@@ -88,47 +97,37 @@ impl ThreadPool {
             x.store((self.main.previous_best_score + 32768) as u32, std::sync::atomic::Ordering::Release);
         });
 
-        let thread_count = self.len();
-        let board = Arc::new(self.main.board.clone());
-
         for worker in &self.workers {
-            worker
-                .start_search(board.clone(), time_manager.clone(), thread_count)
-                .expect("Failed to send function to worker thread");
+            worker.start_search(request.clone()).expect("Failed to send function to worker thread");
         }
 
-        self.main.time_manager = time_manager;
-        search::start(&mut self.main, report, thread_count);
+        self.main.time_manager = request.time_manager;
+        self.main.multi_pv = request.multi_pv;
+        search::start(&mut self.main, request.report, request.thread_count);
         shared.status.set(Status::STOPPED);
 
-        let mut results = Vec::with_capacity(thread_count);
-        results.push(SearchSnapshot::from(&self.main));
+        let mut helpers = Vec::with_capacity(self.workers.len());
 
         for worker in &self.workers {
-            results.push(worker.recv_result());
+            helpers.push(worker.recv_result());
         }
 
-        results
+        SearchResults { main: SearchSnapshot::from(&self.main), helpers }
     }
 }
 
 struct WorkerThread {
     handle: JoinHandle<()>,
     commands: SyncSender<WorkerCommand>,
-    results: Receiver<SearchSnapshot>,
+    results: Receiver<HelperSearchResult>,
 }
 
 impl WorkerThread {
-    fn start_search(
-        &self,
-        board: Arc<Board>,
-        time_manager: TimeManager,
-        thread_count: usize,
-    ) -> Result<(), std::sync::mpsc::SendError<WorkerCommand>> {
-        self.commands.send(WorkerCommand::Search { board, time_manager, thread_count })
+    fn start_search(&self, request: SearchRequest) -> Result<(), std::sync::mpsc::SendError<WorkerCommand>> {
+        self.commands.send(WorkerCommand::Search(request))
     }
 
-    fn recv_result(&self) -> SearchSnapshot {
+    fn recv_result(&self) -> HelperSearchResult {
         self.results.recv().expect("Worker thread failed to report search results")
     }
 
@@ -139,8 +138,28 @@ impl WorkerThread {
 }
 
 enum WorkerCommand {
-    Search { board: Arc<Board>, time_manager: TimeManager, thread_count: usize },
+    Search(SearchRequest),
     Exit,
+}
+
+struct WorkerState {
+    td: ThreadData,
+}
+
+impl WorkerState {
+    fn new(id: usize, shared: Arc<SharedContext>, board: Arc<Board>) -> Self {
+        let mut td = make_main_thread_data(shared, board);
+        td.id = id;
+        Self { td }
+    }
+
+    fn run_search(&mut self, request: SearchRequest) -> HelperSearchResult {
+        self.td.time_manager = request.time_manager;
+        self.td.multi_pv = request.multi_pv;
+        self.td.board = (*request.board).clone();
+        search::start(&mut self.td, Report::None, request.thread_count);
+        HelperSearchResult::from(&self.td)
+    }
 }
 
 fn make_worker_thread(id: usize, shared: Arc<SharedContext>, board: Arc<Board>) -> WorkerThread {
@@ -151,16 +170,12 @@ fn make_worker_thread(id: usize, shared: Arc<SharedContext>, board: Arc<Board>) 
         #[cfg(feature = "numa")]
         crate::numa::bind_thread(id - 1);
 
-        let mut td = make_main_thread_data(shared, board);
-        td.id = id;
+        let mut state = WorkerState::new(id, shared, board);
 
         while let Ok(command) = command_rx.recv() {
             match command {
-                WorkerCommand::Search { board, time_manager, thread_count } => {
-                    td.time_manager = time_manager;
-                    td.board = (*board).clone();
-                    search::start(&mut td, Report::None, thread_count);
-                    result_tx.send(SearchSnapshot::from(&td)).expect("Main thread dropped worker result receiver");
+                WorkerCommand::Search(request) => {
+                    result_tx.send(state.run_search(request)).expect("Main thread dropped worker result receiver");
                 }
                 WorkerCommand::Exit => break,
             }

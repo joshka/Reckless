@@ -6,7 +6,7 @@ use crate::{
     board::{Board, NullBoardObserver},
     search::Report,
     thread::{SharedContext, Status, ThreadData},
-    threadpool::ThreadPool,
+    threadpool::{SearchRequest, ThreadPool},
     time::{Limits, TimeManager},
     tools,
     transposition::DEFAULT_TT_SIZE,
@@ -187,59 +187,84 @@ fn go(threads: &mut ThreadPool, settings: &Settings, shared: &Arc<SharedContext>
     let limits = parse_limits(board.side_to_move(), tokens);
     let time_manager = TimeManager::new(limits, board.fullmove_number(), settings.move_overhead);
 
-    threads.main_thread().multi_pv = settings.multi_pv;
-    let results = threads.execute_searches(time_manager, settings.report, shared);
+    let results = threads.execute_searches(
+        SearchRequest {
+            board: Arc::new(threads.board().clone()),
+            time_manager,
+            report: settings.report,
+            thread_count: threads.len(),
+            multi_pv: settings.multi_pv,
+        },
+        shared,
+    );
 
-    let min_score = results.iter().map(|v| v.root_moves[0].score).min().unwrap();
-    let vote_value = |td: &crate::thread::SearchSnapshot| (td.root_moves[0].score - min_score + 10) * td.completed_depth;
+    let min_score = std::iter::once(&results.main)
+        .map(|v| v.root_moves[0].score)
+        .chain(results.helpers.iter().map(|v| v.best_move.score))
+        .min()
+        .unwrap();
+    let vote_main = |td: &crate::thread::SearchSnapshot| (td.root_moves[0].score - min_score + 10) * td.completed_depth;
+    let vote_helper =
+        |td: &crate::thread::HelperSearchResult| (td.best_move.score - min_score + 10) * td.completed_depth;
 
     let mut votes: HashMap<&Move, i32> = HashMap::new();
-    for result in &results {
-        *votes.entry(&result.root_moves[0].mv).or_default() += vote_value(result);
+    *votes.entry(&results.main.root_moves[0].mv).or_default() += vote_main(&results.main);
+    for result in &results.helpers {
+        *votes.entry(&result.best_move.mv).or_default() += vote_helper(result);
     }
 
-    let mut best = 0;
+    enum BestThread<'a> {
+        Main(&'a crate::thread::SearchSnapshot),
+        Helper(&'a crate::thread::HelperSearchResult),
+    }
 
-    if !matches!(results[best].time_manager.limits(), Limits::Depth(_)) && results[0].multi_pv == 1 {
-        for current in 1..results.len() {
+    let mut best = BestThread::Main(&results.main);
+
+    if !matches!(results.main.time_manager.limits(), Limits::Depth(_)) && results.main.multi_pv == 1 {
+        for current in &results.helpers {
             let is_better_candidate = || -> bool {
-                let best = &results[best];
-                let current = &results[current];
+                let (best_move, best_depth) = match best {
+                    BestThread::Main(best) => (&best.root_moves[0], best.completed_depth),
+                    BestThread::Helper(best) => (&best.best_move, best.completed_depth),
+                };
 
-                if is_win(best.root_moves[0].score) {
-                    return current.root_moves[0].score > best.root_moves[0].score;
+                if is_win(best_move.score) {
+                    return current.best_move.score > best_move.score;
                 }
 
-                if current.root_moves[0].score != -Score::INFINITE
-                    && best.root_moves[0].score != -Score::INFINITE
-                    && is_loss(best.root_moves[0].score)
+                if current.best_move.score != -Score::INFINITE
+                    && best_move.score != -Score::INFINITE
+                    && is_loss(best_move.score)
                 {
-                    return current.root_moves[0].score < best.root_moves[0].score;
+                    return current.best_move.score < best_move.score;
                 }
 
-                if current.root_moves[0].score != -Score::INFINITE && is_decisive(current.root_moves[0].score) {
+                if current.best_move.score != -Score::INFINITE && is_decisive(current.best_move.score) {
                     return true;
                 }
 
-                let best_vote = votes[&best.root_moves[0].mv];
-                let current_vote = votes[&current.root_moves[0].mv];
+                let best_vote = votes[&best_move.mv];
+                let current_vote = votes[&current.best_move.mv];
 
-                !is_loss(current.root_moves[0].score)
+                !is_loss(current.best_move.score)
                     && (current_vote > best_vote
-                        || (current_vote == best_vote && vote_value(current) > vote_value(best)))
+                        || (current_vote == best_vote
+                            && vote_helper(current) > (best_move.score - min_score + 10) * best_depth))
             };
 
             if is_better_candidate() {
-                best = current;
+                best = BestThread::Helper(current);
             }
         }
     }
 
-    if best != 0 {
-        results[best].print_uci_info(shared, threads.board(), results[best].completed_depth);
+    match best {
+        BestThread::Main(best) => println!("bestmove {}", best.root_moves[0].mv.to_uci(threads.board())),
+        BestThread::Helper(best) => {
+            best.print_uci_info(shared, threads.board());
+            println!("bestmove {}", best.best_move.mv.to_uci(threads.board()));
+        }
     }
-
-    println!("bestmove {}", results[best].root_moves[0].mv.to_uci(threads.board()));
     crate::misc::dbg_print();
 }
 
