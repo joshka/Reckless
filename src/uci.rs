@@ -81,7 +81,7 @@ pub fn message_loop(mut buffer: VecDeque<String>) {
             // Non-UCI commands
             ["compiler"] => compiler(),
             ["eval"] => eval(threads.main_thread()),
-            ["d"] => println!("{}", threads.main_thread().board),
+            ["d"] => println!("{}", threads.board()),
             ["bench", args @ ..] => match mode {
                 Mode::Uci => tools::bench::<true>(args),
                 Mode::Cli => tools::bench::<false>(args),
@@ -183,28 +183,28 @@ fn reset(threads: &mut ThreadPool, shared: &Arc<SharedContext>) {
 }
 
 fn go(threads: &mut ThreadPool, settings: &Settings, shared: &Arc<SharedContext>, tokens: &[&str]) {
-    let board = &threads.main_thread().board;
+    let board = threads.board();
     let limits = parse_limits(board.side_to_move(), tokens);
     let time_manager = TimeManager::new(limits, board.fullmove_number(), settings.move_overhead);
 
     threads.main_thread().multi_pv = settings.multi_pv;
-    threads.execute_searches(time_manager, settings.report, shared);
+    let results = threads.execute_searches(time_manager, settings.report, shared);
 
-    let min_score = threads.iter().map(|v| v.root_moves[0].score).min().unwrap();
-    let vote_value = |td: &ThreadData| (td.root_moves[0].score - min_score + 10) * td.completed_depth;
+    let min_score = results.iter().map(|v| v.root_moves[0].score).min().unwrap();
+    let vote_value = |td: &crate::thread::SearchSnapshot| (td.root_moves[0].score - min_score + 10) * td.completed_depth;
 
     let mut votes: HashMap<&Move, i32> = HashMap::new();
-    for result in threads.iter() {
+    for result in &results {
         *votes.entry(&result.root_moves[0].mv).or_default() += vote_value(result);
     }
 
     let mut best = 0;
 
-    if !matches!(threads[best].time_manager.limits(), Limits::Depth(_)) && threads[0].multi_pv == 1 {
-        for current in 1..threads.len() {
+    if !matches!(results[best].time_manager.limits(), Limits::Depth(_)) && results[0].multi_pv == 1 {
+        for current in 1..results.len() {
             let is_better_candidate = || -> bool {
-                let best = &threads[best];
-                let current = &threads[current];
+                let best = &results[best];
+                let current = &results[current];
 
                 if is_win(best.root_moves[0].score) {
                     return current.root_moves[0].score > best.root_moves[0].score;
@@ -236,15 +236,15 @@ fn go(threads: &mut ThreadPool, settings: &Settings, shared: &Arc<SharedContext>
     }
 
     if best != 0 {
-        threads[best].print_uci_info(threads[best].completed_depth);
+        results[best].print_uci_info(shared, threads.board(), results[best].completed_depth);
     }
 
-    println!("bestmove {}", threads[best].root_moves[0].mv.to_uci(&threads.main_thread().board));
+    println!("bestmove {}", results[best].root_moves[0].mv.to_uci(threads.board()));
     crate::misc::dbg_print();
 }
 
 fn position(threads: &mut ThreadPool, settings: &Settings, mut tokens: &[&str]) {
-    let mut board = threads.main_thread().board.clone();
+    let mut board = threads.board().clone();
 
     while !tokens.is_empty() {
         match tokens {
@@ -270,9 +270,7 @@ fn position(threads: &mut ThreadPool, settings: &Settings, mut tokens: &[&str]) 
         }
     }
 
-    for thread in threads.iter_mut() {
-        thread.board = board.clone();
-    }
+    threads.set_board(board);
 }
 
 fn make_uci_move(board: &mut Board, uci_move: &str) {

@@ -200,8 +200,33 @@ impl ThreadData {
     }
 
     pub fn print_uci_info(&self, depth: i32) {
+        SearchSnapshot::from(self).print_uci_info(&self.shared, &self.board, depth);
+    }
+}
+
+#[derive(Clone)]
+pub struct SearchSnapshot {
+    pub time_manager: TimeManager,
+    pub root_moves: Vec<RootMove>,
+    pub completed_depth: i32,
+    pub multi_pv: usize,
+    pub root_in_tb: bool,
+}
+
+impl SearchSnapshot {
+    pub fn from(td: &ThreadData) -> Self {
+        Self {
+            time_manager: td.time_manager.clone(),
+            root_moves: td.root_moves.clone(),
+            completed_depth: td.completed_depth,
+            multi_pv: td.multi_pv,
+            root_in_tb: td.root_in_tb,
+        }
+    }
+
+    pub fn print_uci_info(&self, shared: &SharedContext, board: &Board, depth: i32) {
         let elapsed = self.time_manager.elapsed();
-        let nps = self.shared.nodes.aggregate() as f64 / elapsed.as_secs_f64();
+        let nps = shared.nodes.aggregate() as f64 / elapsed.as_secs_f64();
         let ms = elapsed.as_millis();
 
         for pv_index in 0..self.multi_pv {
@@ -227,7 +252,7 @@ impl ThreadData {
 
             let mut formatted_score = match score.abs() {
                 s if s < Score::TB_WIN_IN_MAX => {
-                    format!("cp {}", normalize_to_cp(score, &self.board))
+                    format!("cp {}", normalize_to_cp(score, board))
                 }
                 s if s <= Score::TB_WIN => {
                     let cp = 20_000 - Score::TB_WIN + score.abs();
@@ -249,14 +274,14 @@ impl ThreadData {
                 "info depth {depth} seldepth {} multipv {} score {formatted_score} nodes {} time {ms} nps {nps:.0} hashfull {} tbhits {} pv",
                 root_move.sel_depth,
                 pv_index + 1,
-                self.shared.nodes.aggregate(),
-                self.shared.tt.hashfull(),
-                self.shared.tb_hits.aggregate(),
+                shared.nodes.aggregate(),
+                shared.tt.hashfull(),
+                shared.tb_hits.aggregate(),
             );
 
-            print!(" {}", root_move.mv.to_uci(&self.board));
+            print!(" {}", root_move.mv.to_uci(board));
             for mv in root_move.pv.line() {
-                print!(" {}", mv.to_uci(&self.board));
+                print!(" {}", mv.to_uci(board));
             }
 
             println!();

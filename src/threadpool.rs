@@ -1,23 +1,21 @@
 use std::{
-    ops::Index,
     sync::{
-        Arc, Condvar, Mutex,
-        atomic::Ordering,
+        Arc,
         mpsc::{Receiver, SyncSender},
     },
-    thread::Scope,
+    thread::JoinHandle,
 };
 
 use crate::{
     board::Board,
     search::{self, Report},
-    thread::{SharedContext, Status, ThreadData},
+    thread::{SearchSnapshot, SharedContext, Status, ThreadData},
     time::TimeManager,
 };
 
 pub struct ThreadPool {
-    pub workers: Vec<WorkerThread>,
-    pub vector: Vec<ThreadData>,
+    main: ThreadData,
+    workers: Vec<WorkerThread>,
 }
 
 impl ThreadPool {
@@ -31,278 +29,153 @@ impl ThreadPool {
     }
 
     pub fn new(shared: Arc<SharedContext>) -> Self {
-        let workers = make_worker_threads(1);
-        let data = make_thread_data(shared, &workers, Board::starting_position().into());
+        let board = Arc::new(Board::starting_position());
+        let main = make_main_thread_data(shared.clone(), board.clone());
+        let workers = make_worker_threads(1, shared, board);
 
-        Self { workers, vector: data }
+        Self { main, workers }
     }
 
     pub fn set_count(&mut self, threads: usize) {
         let threads = threads.clamp(1, ThreadPool::available_threads());
-        let shared = self.vector[0].shared.clone();
-        let board = Arc::new(self.vector[0].board.clone());
+        let shared = self.main.shared.clone();
+        let board = Arc::new(self.main.board.clone());
 
         self.workers.drain(..).for_each(WorkerThread::join);
-        self.workers = make_worker_threads(threads);
-
-        std::mem::drop(self.vector.drain(..));
-        self.vector = make_thread_data(shared, &self.workers, board);
+        self.main = make_main_thread_data(shared.clone(), board.clone());
+        self.workers = make_worker_threads(threads, shared, board);
     }
 
     pub fn main_thread(&mut self) -> &mut ThreadData {
-        &mut self.vector[0]
+        &mut self.main
+    }
+
+    pub fn board(&self) -> &Board {
+        &self.main.board
     }
 
     pub const fn len(&self) -> usize {
-        self.vector.len()
+        self.workers.len() + 1
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &ThreadData> {
-        self.vector.iter()
-    }
-
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut ThreadData> {
-        self.vector.iter_mut()
+    pub fn set_board(&mut self, board: Board) {
+        self.main.board = board;
     }
 
     pub fn clear(&mut self) {
-        let shared = self.vector[0].shared.clone();
+        let shared = self.main.shared.clone();
+        let threads = self.len();
+        let board = Arc::new(Board::starting_position());
 
-        std::mem::drop(self.vector.drain(..));
-        self.vector = make_thread_data(shared, &self.workers, Board::starting_position().into());
+        self.workers.drain(..).for_each(WorkerThread::join);
+        self.main = make_main_thread_data(shared.clone(), board.clone());
+        self.workers = make_worker_threads(threads, shared, board);
     }
 
-    pub fn execute_searches(&mut self, time_manager: TimeManager, report: Report, shared: &Arc<SharedContext>) {
+    pub fn execute_searches(
+        &mut self,
+        time_manager: TimeManager,
+        report: Report,
+        shared: &Arc<SharedContext>,
+    ) -> Vec<SearchSnapshot> {
         shared.tt.increment_age();
 
         shared.nodes.reset();
         shared.tb_hits.reset();
-        shared.soft_stop_votes.store(0, Ordering::Release);
+        shared.soft_stop_votes.store(0, std::sync::atomic::Ordering::Release);
         shared.status.set(Status::RUNNING);
         shared.best_stats.iter().for_each(|x| {
-            x.store((self.main_thread().previous_best_score + 32768) as u32, Ordering::Release);
+            x.store((self.main.previous_best_score + 32768) as u32, std::sync::atomic::Ordering::Release);
         });
 
-        std::thread::scope(|scope| {
-            let mut handlers = Vec::new();
+        let thread_count = self.len();
+        let board = Arc::new(self.main.board.clone());
 
-            let thread_count = self.vector.len();
+        for worker in &self.workers {
+            worker
+                .start_search(board.clone(), time_manager.clone(), thread_count)
+                .expect("Failed to send function to worker thread");
+        }
 
-            let (t1, rest) = self.vector.split_first_mut().unwrap();
-            let (w1, rest_workers) = self.workers.split_first().unwrap();
+        self.main.time_manager = time_manager;
+        search::start(&mut self.main, report, thread_count);
+        shared.status.set(Status::STOPPED);
 
-            let tm = time_manager.clone();
-            handlers.push(scope.spawn_into(
-                move || {
-                    t1.time_manager = tm;
+        let mut results = Vec::with_capacity(thread_count);
+        results.push(SearchSnapshot::from(&self.main));
 
-                    search::start(t1, report, thread_count);
-                    shared.status.set(Status::STOPPED);
-                },
-                w1,
-            ));
+        for worker in &self.workers {
+            results.push(worker.recv_result());
+        }
 
-            for (index, (t, w)) in rest.iter_mut().zip(rest_workers).enumerate() {
-                let tm = time_manager.clone();
-                handlers.push(scope.spawn_into(
-                    move || {
-                        t.id = index + 1;
-                        t.time_manager = tm;
-
-                        search::start(t, Report::None, thread_count);
-                    },
-                    w,
-                ));
-            }
-
-            for handler in handlers {
-                handler.join();
-            }
-        });
+        results
     }
 }
 
-impl Index<usize> for ThreadPool {
-    type Output = ThreadData;
-
-    fn index(&self, index: usize) -> &Self::Output {
-        &self.vector[index]
-    }
-}
-
-pub struct WorkerThread {
-    handle: std::thread::JoinHandle<()>,
-    comms: WorkSender,
+struct WorkerThread {
+    handle: JoinHandle<()>,
+    commands: SyncSender<WorkerCommand>,
+    results: Receiver<SearchSnapshot>,
 }
 
 impl WorkerThread {
-    pub fn join(self) {
-        drop(self.comms); // Drop the sender to signal the worker thread to finish
+    fn start_search(
+        &self,
+        board: Arc<Board>,
+        time_manager: TimeManager,
+        thread_count: usize,
+    ) -> Result<(), std::sync::mpsc::SendError<WorkerCommand>> {
+        self.commands.send(WorkerCommand::Search { board, time_manager, thread_count })
+    }
+
+    fn recv_result(&self) -> SearchSnapshot {
+        self.results.recv().expect("Worker thread failed to report search results")
+    }
+
+    fn join(self) {
+        let _ = self.commands.send(WorkerCommand::Exit);
         self.handle.join().expect("Worker thread panicked");
     }
 }
 
-// Handle for communicating with a worker thread.
-// Contains a sender for sending messages to the worker thread,
-// and a receiver for receiving messages from the worker thread.
-struct WorkSender {
-    // INVARIANT: Each send must be matched by a receive.
-    sender: SyncSender<WorkItem>,
-    completion_signal: Arc<(Mutex<bool>, Condvar)>,
+enum WorkerCommand {
+    Search { board: Arc<Board>, time_manager: TimeManager, thread_count: usize },
+    Exit,
 }
 
-/// Handle for the receiver side of a worker thread.
-struct WorkReceiver {
-    receiver: Receiver<WorkItem>,
-    completion_signal: Arc<(Mutex<bool>, Condvar)>,
-}
-
-struct WorkItem {
-    run: unsafe fn(*mut ()),
-    data: *mut (),
-}
-
-unsafe impl Send for WorkItem {}
-
-fn make_work_channel() -> (WorkSender, WorkReceiver) {
-    let (sender, receiver) = std::sync::mpsc::sync_channel(0);
-    let completion_signal = Arc::new((Mutex::new(false), Condvar::new()));
-
-    (
-        WorkSender { sender, completion_signal: Arc::clone(&completion_signal) },
-        WorkReceiver { receiver, completion_signal },
-    )
-}
-
-pub struct ReceiverHandle<'scope> {
-    completion_signal: &'scope Arc<(Mutex<bool>, Condvar)>,
-    received: bool,
-}
-
-impl ReceiverHandle<'_> {
-    pub fn join(mut self) {
-        let (lock, cvar) = &**self.completion_signal;
-        let mut completed = lock.lock().unwrap();
-        while !*completed {
-            completed = cvar.wait(completed).unwrap();
-        }
-        drop(completed);
-        self.received = true;
-    }
-}
-
-impl Drop for ReceiverHandle<'_> {
-    fn drop(&mut self) {
-        // When the receiver handle is dropped, we ensure that we have received something.
-        assert!(self.received, "ReceiverHandle was dropped without receiving a value");
-    }
-}
-
-pub trait ScopeExt<'scope, 'env> {
-    fn spawn_into<F>(&'scope self, f: F, comms: &'scope WorkerThread) -> ReceiverHandle<'scope>
-    where
-        F: FnOnce() + Send + 'scope;
-}
-
-impl<'scope, 'env> ScopeExt<'scope, 'env> for Scope<'scope, 'env> {
-    fn spawn_into<'comms, F>(&'scope self, f: F, thread: &'scope WorkerThread) -> ReceiverHandle<'scope>
-    where
-        F: FnOnce() + Send + 'scope,
-    {
-        unsafe fn run_scoped<F: FnOnce()>(data: *mut ()) {
-            let boxed = unsafe { Box::from_raw(data.cast::<F>()) };
-            boxed();
-        }
-
-        // Safety: The scoped handle guarantees the task is joined before borrowed data can expire.
-        let task = WorkItem {
-            run: run_scoped::<F>,
-            data: Box::into_raw(Box::new(f)).cast(),
-        };
-
-        // Reset the completion flag before sending the task
-        {
-            let (lock, _) = &*thread.comms.completion_signal;
-            let mut completed = lock.lock().unwrap();
-            *completed = false;
-        }
-
-        if let Err(err) = thread.comms.sender.send(task) {
-            drop(unsafe { Box::from_raw(err.0.data.cast::<F>()) });
-            panic!("Failed to send function to worker thread");
-        }
-
-        ReceiverHandle {
-            completion_signal: &thread.comms.completion_signal,
-            // Important: We start with `received` as false.
-            received: false,
-        }
-    }
-}
-
-fn make_worker_thread(id: Option<usize>) -> WorkerThread {
-    let (sender, receiver) = make_work_channel();
+fn make_worker_thread(id: usize, shared: Arc<SharedContext>, board: Arc<Board>) -> WorkerThread {
+    let (commands, command_rx) = std::sync::mpsc::sync_channel(0);
+    let (result_tx, results) = std::sync::mpsc::sync_channel(0);
 
     let handle = std::thread::spawn(move || {
         #[cfg(feature = "numa")]
-        if let Some(id) = id {
-            crate::numa::bind_thread(id);
-        }
-        #[cfg(not(feature = "numa"))]
-        let _ = id;
+        crate::numa::bind_thread(id - 1);
 
-        while let Ok(work) = receiver.receiver.recv() {
-            unsafe { (work.run)(work.data) };
-            let (lock, cvar) = &*receiver.completion_signal;
-            let mut completed = lock.lock().unwrap();
-            *completed = true;
-            drop(completed); // Release the lock before notifying
-            cvar.notify_one();
+        let mut td = make_main_thread_data(shared, board);
+        td.id = id;
+
+        while let Ok(command) = command_rx.recv() {
+            match command {
+                WorkerCommand::Search { board, time_manager, thread_count } => {
+                    td.time_manager = time_manager;
+                    td.board = (*board).clone();
+                    search::start(&mut td, Report::None, thread_count);
+                    result_tx.send(SearchSnapshot::from(&td)).expect("Main thread dropped worker result receiver");
+                }
+                WorkerCommand::Exit => break,
+            }
         }
     });
 
-    WorkerThread { handle, comms: sender }
+    WorkerThread { handle, commands, results }
 }
 
-fn make_worker_threads(num_threads: usize) -> Vec<WorkerThread> {
-    #[cfg(feature = "numa")]
-    {
-        let concurrency = std::thread::available_parallelism().map_or(1, |n| n.get());
-        (0..num_threads).map(|id| make_worker_thread((num_threads >= concurrency / 2).then_some(id))).collect()
-    }
-    #[cfg(not(feature = "numa"))]
-    {
-        (0..num_threads).map(|_| make_worker_thread(None)).collect()
-    }
+fn make_worker_threads(num_threads: usize, shared: Arc<SharedContext>, board: Arc<Board>) -> Vec<WorkerThread> {
+    (1..num_threads).map(|id| make_worker_thread(id, shared.clone(), board.clone())).collect()
 }
 
-fn make_thread_data(shared: Arc<SharedContext>, worker_threads: &[WorkerThread], board: Arc<Board>) -> Vec<ThreadData> {
-    std::thread::scope(|scope| -> Vec<ThreadData> {
-        let handles = worker_threads
-            .iter()
-            .map(|worker| {
-                let (tx, rx) = std::sync::mpsc::channel();
-                let shared = shared.clone();
-                let board = board.clone();
-                let join_handle = scope.spawn_into(
-                    move || {
-                        let mut td = Box::new(ThreadData::new(shared));
-                        td.board = (*board).clone();
-                        tx.send(td).unwrap();
-                    },
-                    worker,
-                );
-                (rx, join_handle)
-            })
-            .collect::<Vec<_>>();
-
-        let mut thread_data: Vec<ThreadData> = Vec::with_capacity(handles.len());
-        for (rx, handle) in handles {
-            let td = rx.recv().unwrap();
-            thread_data.push(*td);
-            handle.join();
-        }
-
-        thread_data
-    })
+fn make_main_thread_data(shared: Arc<SharedContext>, board: Arc<Board>) -> ThreadData {
+    let mut td = ThreadData::new(shared);
+    td.board = (*board).clone();
+    td
 }
