@@ -1,6 +1,7 @@
 mod accumulator;
 
 pub use accumulator::threats::initialize;
+use zerocopy::{FromBytes, Immutable, KnownLayout};
 
 use crate::{
     board::{Board, BoardObserver},
@@ -313,6 +314,7 @@ impl BoardObserver for Network {
 }
 
 #[repr(C)]
+#[derive(FromBytes, KnownLayout, Immutable)]
 struct Parameters {
     ft_threat_weights: Aligned<[[i8; L1_SIZE]; 66864]>,
     ft_piece_weights: Aligned<[[i16; L1_SIZE]; INPUT_BUCKETS * 768]>,
@@ -325,10 +327,10 @@ struct Parameters {
     l3_biases: Aligned<[f32; OUTPUT_BUCKETS]>,
 }
 
-static PARAMETERS: Parameters = unsafe { std::mem::transmute(*include_bytes!(env!("MODEL"))) };
+static PARAMETERS: Parameters = zerocopy::include_value!(env!("MODEL"));
 
 #[repr(align(64))]
-#[derive(Clone)]
+#[derive(Clone, FromBytes, KnownLayout, Immutable)]
 struct Aligned<T> {
     data: T,
 }
