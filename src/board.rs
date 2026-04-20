@@ -103,6 +103,10 @@ impl Board {
         self.state.checking_squares[pt as usize]
     }
 
+    pub const fn checking_squares_bbs(&self) -> [Bitboard; PieceType::NUM] {
+        self.state.checking_squares
+    }
+
     pub const fn checkers(&self) -> Bitboard {
         self.state.checkers
     }

@@ -172,6 +172,12 @@ impl MovePicker {
         let threats = td.board.all_threats();
         let side = td.board.side_to_move();
         let occupancies = td.board.occupancies();
+        let continuation_history = &td.continuation_history;
+        let quiet_history = &td.quiet_history;
+        let cont1 = td.stack[ply - 1].conthist;
+        let cont2 = td.stack[ply - 2].conthist;
+        let cont4 = td.stack[ply - 4].conthist;
+        let cont6 = td.stack[ply - 6].conthist;
 
         let threatened = {
             let pawn_threats = td.board.piece_threats(PieceType::Pawn);
@@ -202,29 +208,39 @@ impl MovePicker {
         };
 
         let king_file = td.board.king_square(!side).file();
+        let checking_squares = td.board.checking_squares_bbs();
+        let own_king = td.board.king_square(side);
 
         // don't move king wall pawns
-        let wall_pawns = if Bitboard::HOME_ROWS[side].contains(td.board.king_square(side)) {
-            king_attacks(td.board.king_square(side)) & td.board.pieces(PieceType::Pawn)
+        let wall_pawns = if Bitboard::HOME_ROWS[side].contains(own_king) {
+            king_attacks(own_king) & td.board.pieces(PieceType::Pawn)
         } else {
             Bitboard(0)
         };
 
+        // This path tries to pay shared indexing costs once per move instead of
+        // repeating them through helper calls. The score stays the same as the
+        // scalar reference logic above it; only the lookup shape changes.
         for entry in self.list.iter_mut() {
             let mv = entry.mv;
-            let pt = td.board.type_on(mv.from());
+            let from = mv.from();
+            let to = mv.to();
+            let piece = td.board.piece_on(from);
+            let pt = piece.piece_type();
+            let from_threatened = threats.contains(from);
+            let to_threatened = threats.contains(to);
 
-            entry.score = 2048 * td.quiet_history.get(threats, side, mv) / 1024
-                + 1536 * td.conthist(ply, 1, mv) / 1024
-                + td.conthist(ply, 2, mv)
-                + td.conthist(ply, 4, mv)
-                + td.conthist(ply, 6, mv)
-                + escape[pt] * threatened[pt].contains(mv.from()) as i32
-                + 9325 * td.board.checking_squares(pt).contains(mv.to()) as i32
-                - 7584 * threatened[pt].contains(mv.to()) as i32
-                + 6158 * offense[pt].contains(mv.to()) as i32
-                + 5000 * (pt == PieceType::Rook && king_file == mv.to().file()) as i32
-                - 4000 * wall_pawns.contains(mv.from()) as i32;
+            entry.score = 2048 * quiet_history.get_at(side, from, to, from_threatened, to_threatened) / 1024
+                + 1536 * continuation_history.get(cont1, piece, to) / 1024
+                + continuation_history.get(cont2, piece, to)
+                + continuation_history.get(cont4, piece, to)
+                + continuation_history.get(cont6, piece, to)
+                + escape[pt] * threatened[pt].contains(from) as i32
+                + 9325 * checking_squares[pt].contains(to) as i32
+                - 7584 * threatened[pt].contains(to) as i32
+                + 6158 * offense[pt].contains(to) as i32
+                + 5000 * (pt == PieceType::Rook && king_file == to.file()) as i32
+                - 4000 * wall_pawns.contains(from) as i32;
         }
     }
 }
