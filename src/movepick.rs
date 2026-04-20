@@ -141,16 +141,30 @@ impl MovePicker {
     }
 
     fn get_best_entry(&mut self) -> MoveEntry {
-        let mut best_index = 0;
-        let mut best_score = i32::MIN;
-
-        for (index, entry) in self.list.iter().enumerate() {
-            if entry.score >= best_score {
-                best_index = index;
-                best_score = entry.score;
-            }
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        {
+            // On AVX2-capable x86 targets, scan scores eight at a time instead of
+            // comparing one entry per iteration. This only changes how we find
+            // the best-scoring move; it preserves the scalar path's behavior,
+            // including preferring the later entry on equal scores.
+            let best_index = unsafe { best_index_avx2(self.list.iter()) };
+            self.list.remove(best_index)
         }
-        self.list.remove(best_index)
+
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+        {
+            let mut best_index = 0;
+            let mut best_score = i32::MIN;
+
+            for (index, entry) in self.list.iter().enumerate() {
+                if entry.score >= best_score {
+                    best_index = index;
+                    best_score = entry.score;
+                }
+            }
+
+            self.list.remove(best_index)
+        }
     }
 
     fn score_noisy(&mut self, td: &ThreadData) {
@@ -226,5 +240,95 @@ impl MovePicker {
                 + 5000 * (pt == PieceType::Rook && king_file == mv.to().file()) as i32
                 - 4000 * wall_pawns.contains(mv.from()) as i32;
         }
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+unsafe fn best_index_avx2(entries: std::slice::Iter<'_, MoveEntry>) -> usize {
+    use std::arch::x86_64::*;
+
+    const LANES: usize = 8;
+
+    let len = entries.len();
+    let ptr = entries.as_slice().as_ptr().cast::<i32>().add(1);
+
+    let mut best_scores = _mm256_set1_epi32(i32::MIN);
+    let mut best_indices = _mm256_set1_epi32(-1);
+
+    // MoveEntry stores the move and score together, so AVX2 gathers let us
+    // load just the score lane from eight entries without changing the data
+    // layout. That makes this a targeted experiment in speeding up move
+    // selection while leaving generation and scoring unchanged.
+    for base in (0..len / LANES * LANES).step_by(LANES) {
+        let indices = _mm256_setr_epi32(
+            base as i32,
+            base as i32 + 1,
+            base as i32 + 2,
+            base as i32 + 3,
+            base as i32 + 4,
+            base as i32 + 5,
+            base as i32 + 6,
+            base as i32 + 7,
+        );
+        let offsets = _mm256_add_epi32(indices, indices);
+        let scores = _mm256_i32gather_epi32(ptr, offsets, 4);
+
+        let better_scores = _mm256_cmpgt_epi32(scores, best_scores);
+        let equal_scores = _mm256_cmpeq_epi32(scores, best_scores);
+        let later_indices = _mm256_cmpgt_epi32(indices, best_indices);
+        let replace = _mm256_or_si256(better_scores, _mm256_and_si256(equal_scores, later_indices));
+
+        best_scores = _mm256_blendv_epi8(best_scores, scores, replace);
+        best_indices = _mm256_blendv_epi8(best_indices, indices, replace);
+    }
+
+    let mut score_buffer = [0; LANES];
+    let mut index_buffer = [0; LANES];
+    _mm256_storeu_si256(score_buffer.as_mut_ptr().cast(), best_scores);
+    _mm256_storeu_si256(index_buffer.as_mut_ptr().cast(), best_indices);
+
+    let mut best_index = 0;
+    let mut best_score = i32::MIN;
+
+    for (&score, &index) in score_buffer.iter().zip(index_buffer.iter()) {
+        if score > best_score || (score == best_score && index > best_index as i32) {
+            best_score = score;
+            best_index = index as usize;
+        }
+    }
+
+    for (index, entry) in entries.as_slice().iter().enumerate().skip(len / LANES * LANES) {
+        if entry.score > best_score || (entry.score == best_score && index > best_index) {
+            best_score = entry.score;
+            best_index = index;
+        }
+    }
+
+    best_index
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{MoveKind, Square};
+
+    #[test]
+    fn get_best_entry_prefers_later_equal_scores() {
+        let mut picker = MovePicker::new(Move::NULL);
+
+        for index in 0..10 {
+            picker.list.push(Square::new(index as u8), Square::new((index + 1) as u8), MoveKind::Normal);
+        }
+
+        let scores = [10, 50, 5, 50, 40, 50, -1, 30, 50, 12];
+        for (entry, score) in picker.list.iter_mut().zip(scores) {
+            entry.score = score;
+        }
+
+        let best = picker.get_best_entry();
+
+        assert_eq!(best.mv.from(), Square::new(8));
+        assert_eq!(best.score, 50);
+        assert_eq!(picker.list.len(), 9);
     }
 }
