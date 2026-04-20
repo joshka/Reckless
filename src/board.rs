@@ -1,7 +1,7 @@
 use crate::{
     lookup::{
         attacks, between, bishop_attacks, cuckoo, cuckoo_a, cuckoo_b, h1, h2, king_attacks, knight_attacks,
-        pawn_attacks, queen_attacks, ray_pass, rook_attacks,
+        pawn_attacks, ray_pass, rook_attacks,
     },
     setwise::{bishop_attacks_setwise, knight_attacks_setwise, pawn_attacks_setwise, rook_attacks_setwise},
     types::{
@@ -427,11 +427,11 @@ impl Board {
         self.state.piece_threats[PieceType::Rook] =
             rook_attacks_setwise(self.colored_pieces(!stm, PieceType::Rook), occupancies);
         self.state.piece_threats[PieceType::Queen] = {
-            let mut threats = Bitboard(0);
-            for square in self.colored_pieces(!stm, PieceType::Queen) {
-                threats |= queen_attacks(square, occupancies);
-            }
-            threats
+            let queens = self.colored_pieces(!stm, PieceType::Queen);
+            // Keep queen threats on the same setwise path as bishops and rooks.
+            // This should only be kept if it stays a measured win over the
+            // scalar per-queen loop it replaces.
+            rook_attacks_setwise(queens, occupancies) | bishop_attacks_setwise(queens, occupancies)
         };
         self.state.piece_threats[PieceType::King] = king_attacks(self.king_square(!stm));
 
