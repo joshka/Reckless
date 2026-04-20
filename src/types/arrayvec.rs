@@ -75,6 +75,23 @@ impl<T: Copy, const N: usize> ArrayVec<T, N> {
 }
 
 impl<const N: usize> ArrayVec<MoveEntry, N> {
+    #[cfg(all(target_feature = "avx2", not(target_feature = "avx512vbmi2")))]
+    pub unsafe fn splat8_avx2(&mut self, mask: u8, vector: std::arch::x86_64::__m128i) {
+        use std::arch::x86_64::*;
+
+        let count = mask.count_ones() as usize;
+        // Compacts selected 16-bit move lanes and writes them in scalar order.
+        let shuffle = _mm_loadu_si128(COMPRESS_MASKS[mask as usize].as_ptr().cast());
+        let compressed = _mm_shuffle_epi8(vector, shuffle);
+        let widened32 = _mm256_cvtepu16_epi32(compressed);
+        let to_write0 = _mm256_cvtepu32_epi64(_mm256_castsi256_si128(widened32));
+        let to_write1 = _mm256_cvtepu32_epi64(_mm256_extracti128_si256::<1>(widened32));
+
+        _mm256_storeu_si256(self.data.get_unchecked_mut(self.len).as_mut_ptr().cast(), to_write0);
+        _mm256_storeu_si256(self.data.get_unchecked_mut(self.len + 4).as_mut_ptr().cast(), to_write1);
+        self.len += count;
+    }
+
     #[cfg(target_feature = "avx512vbmi2")]
     pub unsafe fn splat8(&mut self, mask: u32, vector: std::arch::x86_64::__m512i) {
         use std::arch::x86_64::*;
@@ -99,6 +116,31 @@ impl<const N: usize> ArrayVec<MoveEntry, N> {
         self.len += count;
     }
 }
+
+// Byte-shuffle table that preserves scalar emission order for each 8-bit mask.
+#[cfg(all(target_feature = "avx2", not(target_feature = "avx512vbmi2")))]
+const COMPRESS_MASKS: [[i8; 16]; 256] = {
+    let mut table = [[-1; 16]; 256];
+    let mut mask = 0;
+
+    while mask < 256 {
+        let mut output = 0;
+        let mut bit = 0;
+
+        while bit < 8 {
+            if (mask & (1 << bit)) != 0 {
+                table[mask][output] = (2 * bit) as i8;
+                table[mask][output + 1] = (2 * bit + 1) as i8;
+                output += 2;
+            }
+            bit += 1;
+        }
+
+        mask += 1;
+    }
+
+    table
+};
 
 impl<const N: usize, T: Copy> Index<usize> for ArrayVec<T, N> {
     type Output = T;
