@@ -32,3 +32,7 @@ macro_rules! define {
         }
     };
 }
+
+define! {
+    i32 helper_reduction_large: 96;
+}
