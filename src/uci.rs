@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::{
     board::{Board, NullBoardObserver},
     search::Report,
-    thread::{SharedContext, Status, ThreadData},
+    thread::{SharedContext, Status, ThreadData, ThreadSearchResult},
     threadpool::ThreadPool,
     time::{Limits, TimeManager},
     tools,
@@ -182,28 +182,28 @@ fn reset(threads: &mut ThreadPool, shared: &Arc<SharedContext>) {
 }
 
 fn go(threads: &mut ThreadPool, settings: &Settings, shared: &Arc<SharedContext>, tokens: &[&str]) {
-    let board = &threads.main_thread().board;
+    let board = threads.board();
     let limits = parse_limits(board.side_to_move(), tokens);
     let time_manager = TimeManager::new(limits, board.fullmove_number(), settings.move_overhead);
 
     threads.main_thread().multi_pv = settings.multi_pv;
     threads.execute_searches(time_manager, settings.report, shared);
 
-    let min_score = threads.iter().map(|v| v.root_moves[0].score).min().unwrap();
-    let vote_value = |td: &ThreadData| (td.root_moves[0].score - min_score + 10) * td.completed_depth;
+    let min_score = threads.results().map(|v| v.root_moves[0].score).min().unwrap();
+    let vote_value = |td: ThreadSearchResult<'_>| (td.root_moves[0].score - min_score + 10) * td.completed_depth;
 
     let mut votes: HashMap<&Move, i32> = HashMap::new();
-    for result in threads.iter() {
+    for result in threads.results() {
         *votes.entry(&result.root_moves[0].mv).or_default() += vote_value(result);
     }
 
     let mut best = 0;
 
-    if !matches!(threads[best].time_manager.limits(), Limits::Depth(_)) && threads[0].multi_pv == 1 {
+    if !matches!(threads.result(best).time_manager.limits(), Limits::Depth(_)) && threads.result(0).multi_pv == 1 {
         for current in 1..threads.len() {
             let is_better_candidate = || -> bool {
-                let best = &threads[best];
-                let current = &threads[current];
+                let best = threads.result(best);
+                let current = threads.result(current);
 
                 if is_win(best.root_moves[0].score) {
                     return current.root_moves[0].score > best.root_moves[0].score;
@@ -235,10 +235,12 @@ fn go(threads: &mut ThreadPool, settings: &Settings, shared: &Arc<SharedContext>
     }
 
     if best != 0 {
-        threads[best].print_uci_info(threads[best].completed_depth);
+        let result = threads.result(best);
+        result.print_uci_info(result.completed_depth);
     }
 
-    println!("bestmove {}", threads[best].root_moves[0].mv.to_uci(&threads.main_thread().board));
+    let result = threads.result(best);
+    println!("bestmove {}", result.root_moves[0].mv.to_uci(result.board));
     crate::misc::dbg_print();
 }
 
@@ -269,9 +271,7 @@ fn position(threads: &mut ThreadPool, settings: &Settings, mut tokens: &[&str]) 
         }
     }
 
-    for thread in threads.iter_mut() {
-        thread.board = board.clone();
-    }
+    threads.set_board(board);
 }
 
 fn make_uci_move(board: &mut Board, uci_move: &str) {

@@ -1,5 +1,4 @@
 use std::{
-    ops::Index,
     sync::{
         Arc, Condvar, Mutex,
         atomic::Ordering,
@@ -11,13 +10,13 @@ use std::{
 use crate::{
     board::Board,
     search::{self, Report},
-    thread::{SharedContext, Status, ThreadData},
+    thread::{SharedContext, Status, ThreadData, ThreadSearchResult},
     time::TimeManager,
 };
 
 pub struct ThreadPool {
-    pub workers: Vec<WorkerThread>,
-    pub vector: Vec<ThreadData>,
+    workers: Vec<WorkerThread>,
+    vector: Vec<ThreadData>,
 }
 
 impl ThreadPool {
@@ -53,16 +52,31 @@ impl ThreadPool {
         &mut self.vector[0]
     }
 
+    pub fn board(&self) -> &Board {
+        &self.vector[0].board
+    }
+
     pub const fn len(&self) -> usize {
         self.vector.len()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &ThreadData> {
-        self.vector.iter()
+    pub fn result(&self, index: usize) -> ThreadSearchResult<'_> {
+        ThreadSearchResult::from(&self.vector[index])
     }
 
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut ThreadData> {
-        self.vector.iter_mut()
+    pub fn results(&self) -> impl Iterator<Item = ThreadSearchResult<'_>> {
+        self.vector.iter().map(ThreadSearchResult::from)
+    }
+
+    pub fn set_board(&mut self, board: Board) {
+        let Some((first, rest)) = self.vector.split_first_mut() else {
+            return;
+        };
+
+        first.board = board;
+        for td in rest {
+            td.board = first.board.clone();
+        }
     }
 
     pub fn clear(&mut self) {
@@ -119,14 +133,6 @@ impl ThreadPool {
                 handler.join();
             }
         });
-    }
-}
-
-impl Index<usize> for ThreadPool {
-    type Output = ThreadData;
-
-    fn index(&self, index: usize) -> &Self::Output {
-        &self.vector[index]
     }
 }
 

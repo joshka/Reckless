@@ -199,6 +199,37 @@ impl ThreadData {
     }
 
     pub fn print_uci_info(&self, depth: i32) {
+        ThreadSearchResult::from(self).print_uci_info(depth);
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct ThreadSearchResult<'a> {
+    pub board: &'a Board,
+    pub time_manager: &'a TimeManager,
+    pub root_moves: &'a [RootMove],
+    pub completed_depth: i32,
+    pub multi_pv: usize,
+    shared: &'a SharedContext,
+    root_in_tb: bool,
+}
+
+impl<'a> From<&'a ThreadData> for ThreadSearchResult<'a> {
+    fn from(td: &'a ThreadData) -> Self {
+        Self {
+            board: &td.board,
+            time_manager: &td.time_manager,
+            root_moves: &td.root_moves,
+            completed_depth: td.completed_depth,
+            multi_pv: td.multi_pv,
+            shared: td.shared.as_ref(),
+            root_in_tb: td.root_in_tb,
+        }
+    }
+}
+
+impl ThreadSearchResult<'_> {
+    pub fn print_uci_info(&self, depth: i32) {
         let elapsed = self.time_manager.elapsed();
         let nps = self.shared.nodes.aggregate() as f64 / elapsed.as_secs_f64();
         let ms = elapsed.as_millis();
@@ -226,7 +257,7 @@ impl ThreadData {
 
             let mut formatted_score = match score.abs() {
                 s if s < Score::TB_WIN_IN_MAX => {
-                    format!("cp {}", normalize_to_cp(score, &self.board))
+                    format!("cp {}", normalize_to_cp(score, self.board))
                 }
                 s if s <= Score::TB_WIN => {
                     let cp = 20_000 - Score::TB_WIN + score.abs();
@@ -253,9 +284,9 @@ impl ThreadData {
                 self.shared.tb_hits.aggregate(),
             );
 
-            print!(" {}", root_move.mv.to_uci(&self.board));
+            print!(" {}", root_move.mv.to_uci(self.board));
             for mv in root_move.pv.line() {
-                print!(" {}", mv.to_uci(&self.board));
+                print!(" {}", mv.to_uci(self.board));
             }
 
             println!();
