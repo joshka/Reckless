@@ -70,6 +70,17 @@ impl NodeType for NonPV {
 fn search<NODE: NodeType>(
     td: &mut ThreadData, mut alpha: i32, mut beta: i32, depth: i32, cut_node: bool, ply: isize,
 ) -> i32 {
+    // Full-width search is intentionally linear here. Function extraction in
+    // this hot path showed measurable speed loss, so the driver keeps the
+    // algorithm in one frame while naming each phase:
+    //
+    // 1. enter node and handle terminal/qsearch guards;
+    // 2. probe TT and tablebases for cutoffs or bounds;
+    // 3. build eval state and initialize stack contracts;
+    // 4. apply pre-move pruning: razoring, RFP, null move, ProbCut;
+    // 5. run singular-extension verification for the TT move;
+    // 6. search ordered moves with pruning, reductions, and PVS;
+    // 7. learn histories, write TT/correction history, and return.
     debug_assert!(ply as usize <= MAX_PLY);
     debug_assert!(-Score::INFINITE <= alpha && alpha < beta && beta <= Score::INFINITE);
     debug_assert!(NODE::PV || alpha == beta - 1);
@@ -86,7 +97,7 @@ fn search<NODE: NodeType>(
         return Score::ZERO;
     }
 
-    // Qsearch Dive
+    // Phase 1: terminal guards and qsearch entry.
     if depth <= 0 {
         return qsearch::<NODE>(td, alpha, beta, ply);
     }
@@ -137,7 +148,7 @@ fn search<NODE: NodeType>(
     let mut tt_probe = tt::TtProbe::read(td, hash, ply, NODE::PV);
     let mut tt_pv = tt_probe.tt_pv;
 
-    // Search early TT cutoff
+    // Phase 2: TT and tablebase proofs before eval.
     if tt_probe.has_entry() {
         if tt_probe.can_cutoff_full_width(NODE::PV, excluded, depth, alpha, beta, cut_node) {
             if tt_probe.mv.is_quiet() && tt_probe.score >= beta && td.stack[ply - 1].move_count < 4 {
@@ -154,7 +165,6 @@ fn search<NODE: NodeType>(
         }
     }
 
-    // Tablebases Probe
     #[cfg(feature = "syzygy")]
     if !NODE::ROOT
         && !excluded
@@ -191,6 +201,7 @@ fn search<NODE: NodeType>(
         }
     }
 
+    // Phase 3: static eval, stack contracts, and parent feedback.
     let eval_state = EvalState::compute(td, hash, ply, in_check, excluded, tt_probe, tt_pv, alpha, beta);
     let raw_eval = eval_state.raw;
     let eval = eval_state.corrected;
@@ -238,12 +249,11 @@ fn search<NODE: NodeType>(
         && is_valid(tt_probe.score)
         && !is_decisive(tt_probe.score);
 
-    // Razoring
+    // Phase 4: pre-move pruning before normal move generation.
     if pruning::can_razor(NODE::PV, in_check, estimated_score, alpha, depth, tt_probe) {
         return qsearch::<NonPV>(td, alpha, beta, ply);
     }
 
-    // Reverse Futility Pruning (RFP)
     if let Some(score) = pruning::reverse_futility_score(
         tt_pv,
         in_check,
@@ -258,7 +268,6 @@ fn search<NODE: NodeType>(
         return score;
     }
 
-    // Null Move Pruning (NMP)
     if pruning::can_try_null_move(
         &td.board,
         cut_node,
@@ -314,7 +323,6 @@ fn search<NODE: NodeType>(
         }
     }
 
-    // ProbCut
     let mut probcut_beta = beta + 270 - 75 * improving as i32;
 
     if pruning::can_try_probcut(cut_node, beta, tt_probe, probcut_beta, eval) {
@@ -366,6 +374,7 @@ fn search<NODE: NodeType>(
         }
     }
 
+    // Phase 5: singular-extension verification for the TT move.
     let singular = singular::search_if_needed(
         td,
         ply,
@@ -399,6 +408,8 @@ fn search<NODE: NodeType>(
     let mut alpha_raises = 0;
     let mut tt_move_score = Score::NONE;
 
+    // Phase 6: ordered move loop. Keep this inline unless a boundary proves
+    // performance-neutral; it is the densest and hottest coupling in search.
     while let Some(mv) = move_picker.next::<NODE>(td, skip_quiets, ply) {
         if mv == td.stack[ply].excluded {
             continue;
@@ -625,6 +636,8 @@ fn search<NODE: NodeType>(
         }
     }
 
+    // Phase 7: no-move handling, history feedback, TT writeback, and
+    // correction-history learning.
     if move_count == 0 {
         if excluded {
             return -Score::TB_WIN_IN_MAX + 1;

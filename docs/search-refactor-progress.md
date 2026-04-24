@@ -62,6 +62,13 @@
   alpha/beta update order, but the tuned LMP/futility/SEE and LMR/FDS formulas
   now live behind named concepts. Validation: bench `3425249` nodes,
   `speedtest 1 16 30` at `36151038` nodes / `1383772` nps.
+- Tried extracting the full move loop behind a `search_move_loop` result object.
+  That made `search` read closer to the pseudo-code target, but repeated
+  `speedtest 1 16 30` samples fell to `1231905` and `1248983` nps. The change
+  was abandoned. The current approach keeps the hot move loop inline and adds a
+  phase outline plus in-code phase markers to make the algorithm visible without
+  adding a call boundary. Validation after returning to the inline loop: bench
+  `3425249` nodes, `speedtest 1 16 30` at `33363710` nodes / `1276347` nps.
 
 ## Problems / Risks
 
@@ -74,6 +81,8 @@
 - `make_move`/`undo_move` remain in `search/mod.rs`. A previous extraction of
   this area showed speed risk, and this block is still the most sensitive
   boundary.
+- The full move loop also appears to be a hot boundary: extracting it as a
+  function created a repeated speed regression even with inline hints.
 
 ## Final Validation
 
