@@ -21,6 +21,12 @@ The desired outcome is not “more modules.” A module or type is useful only w
 it names a real chess-search concept and reduces the number of live facts a
 reader has to track.
 
+The practical readability target is that each function, struct, and module fits
+in a maintainer's head. A reader should be able to understand one item at a
+time, including its invariants and side effects, without reconstructing the
+entire search. When a function still needs to be long for performance reasons,
+its visual paragraphs should map directly to algorithm phases.
+
 ## Design Rules
 
 Keep the phase order visible. The full-width driver should read top-to-bottom
@@ -146,6 +152,33 @@ Useful local docs can cite the external concept by name without turning source
 comments into a wiki. Broad explanations and references belong in
 `docs/search-algorithm.md` or focused design notes; source docs should state
 which variant this engine uses and what ordering or state invariant matters.
+
+## Rust Style Target
+
+Use idiomatic Rust where it has no measurable performance cost. In practice,
+that means:
+
+- prefer small value types with clear invariants over primitive bundles;
+- put behavior in inherent `impl` blocks when a concept has a clear receiver;
+- derive common traits such as `Copy`, `Clone`, `Debug`, `Eq`, or `Default`
+  when that makes local debugging and tests easier;
+- use iterators for pure transformations, but prefer explicit `for` loops when
+  mutation or search side effects matter;
+- keep directory-root modules as tables of contents when the module grows;
+- put the central item first and arrange helper functions near their caller
+  when the helper is not a strong standalone abstraction;
+- use module docs and short first sentences for concept modules;
+- use strong types for meaningful distinctions, but avoid type ceremony around
+  tuned scalar formulas when it obscures experimentation.
+
+The Rust API Guidelines are useful for naming, receiver methods, type safety,
+debuggability, and predictable APIs. Epage's Rust style guidance is especially
+relevant for file structure and function readability: central item first,
+caller before callee, grouped logic, and avoiding hidden side effects in
+combinators. Microsoft's pragmatic Rust guidelines reinforce module docs,
+strong types, testability, and identifying hot paths early. In this engine, all
+of those guidelines are subordinate to deterministic behavior and measured
+hot-path performance.
 
 ## Target Full-Width Shape
 
