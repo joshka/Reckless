@@ -9,6 +9,12 @@ use crate::types::{Move, is_valid};
 
 use super::tt::TtProbe;
 
+/// Inputs shared by the move loop's child-search reduction formulas.
+///
+/// This is not a general node context. It only packages the values used to
+/// choose reduced scout depths after a move has been made. Keeping the context
+/// this narrow avoids turning `ThreadData` into another hidden dependency while
+/// still showing which cross-heuristic signals feed reduction policy.
 #[derive(Copy, Clone)]
 pub(super) struct ReductionContext {
     pub depth: i32,
@@ -32,6 +38,13 @@ pub(super) struct ReductionContext {
 }
 
 impl ReductionContext {
+    /// Reduction for the first reduced scout search.
+    ///
+    /// This is the engine's LMR policy: move index and depth form the base,
+    /// then TT quality, correction-history magnitude, move history, PV shape,
+    /// improvement, child cutoff history, singular-search margin, and helper
+    /// thread bias all adjust the reduction. The caller keeps the actual scout
+    /// search visible because retry order is behavioral.
     #[inline]
     pub fn late_move_reduction(self, is_quiet: bool, history: i32, child_in_check: bool) -> i32 {
         let mut reduction = 225 * (self.move_count.ilog2() * self.depth.ilog2()) as i32;
@@ -90,11 +103,20 @@ impl ReductionContext {
         reduction + self.helper_bias
     }
 
+    /// Convert the LMR reduction score into the reduced scout depth.
+    ///
+    /// PV nodes receive extra depth here; that branch-order detail is part of
+    /// the tuned search shape, not a generic property of reductions.
     #[inline]
     pub fn late_move_reduced_depth(self, new_depth: i32, reduction: i32) -> i32 {
         (new_depth - reduction / 1024).clamp(1, new_depth + (self.move_count <= 3) as i32 + 1) + 2 * self.node_pv as i32
     }
 
+    /// Reduction for the full-depth scout path used outside the LMR branch.
+    ///
+    /// This path is still a scout search, but it uses a different formula and
+    /// gives the TT move a large depth credit. Keeping it separate from LMR
+    /// prevents the two tuned policies from looking interchangeable.
     #[inline]
     pub fn full_depth_reduction(self, mv: Move, is_quiet: bool, history: i32) -> i32 {
         let mut reduction = 232 * (self.move_count.ilog2() * self.depth.ilog2()) as i32;
@@ -144,6 +166,10 @@ impl ReductionContext {
         reduction + self.helper_bias
     }
 
+    /// Convert the full-depth reduction score into a scout depth.
+    ///
+    /// The two threshold checks are part of this engine's tuned depth policy;
+    /// callers should not reuse them for LMR.
     #[inline]
     pub fn full_depth_reduced_depth(self, new_depth: i32, reduction: i32) -> i32 {
         new_depth - (reduction >= 2864) as i32 - (reduction >= 5585) as i32

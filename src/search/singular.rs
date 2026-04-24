@@ -13,6 +13,13 @@ use crate::{
 
 use super::{NonPV, search, tt::TtProbe};
 
+/// Result of the singular-extension verification search.
+///
+/// A singular search does more than choose an extension. It may prove a
+/// multi-cut, invalidate the TT move for ordering, or apply a negative
+/// extension when the TT move is not singular enough. Grouping those effects
+/// keeps the full-width driver from having to remember which scalar was set by
+/// which singular-search branch.
 #[derive(Copy, Clone)]
 pub(super) struct SingularOutcome {
     pub extension: i32,
@@ -27,6 +34,12 @@ impl SingularOutcome {
     }
 }
 
+/// Run singular-extension verification when the TT evidence is strong enough.
+///
+/// The search temporarily excludes the TT move at the current ply and searches
+/// alternatives with a reduced non-PV window. That stack mutation is the core
+/// invariant: the excluded move must be restored before returning, and the
+/// caller must apply the returned TT-move replacement before move ordering.
 pub(super) fn search_if_needed(
     td: &mut ThreadData, ply: isize, depth: i32, beta: i32, cut_node: bool, node_root: bool, node_pv: bool,
     excluded: bool, potential: bool, tt_probe: TtProbe, correction: i32,

@@ -14,6 +14,12 @@ use crate::{
 use super::tt::TtProbe;
 
 /// Static eval view used by the full-width node after TT/tablebase probing.
+///
+/// Search eval is not just NNUE. The full-width node needs the raw NNUE value
+/// for TT storage, the correction-adjusted value for history feedback, a
+/// TT-adjusted estimate for pruning, and improvement signals for pruning and
+/// reductions. Keeping those together makes later consumers name which eval
+/// role they mean.
 #[derive(Copy, Clone)]
 pub(super) struct EvalState {
     pub raw: i32,
@@ -25,6 +31,12 @@ pub(super) struct EvalState {
 }
 
 impl EvalState {
+    /// Build the eval state in the order required by search.
+    ///
+    /// Excluded singular-verification nodes reuse the stack eval instead of
+    /// refreshing NNUE, and fresh NNUE evals write a raw-eval-only TT entry
+    /// before pruning can return. TT bounds may adjust the estimate after the
+    /// corrected eval exists, but only when the bound direction is compatible.
     #[inline]
     pub fn compute(
         td: &mut ThreadData, hash: u64, ply: isize, in_check: bool, excluded: bool, tt_probe: TtProbe, tt_pv: bool,
@@ -81,6 +93,11 @@ impl EvalState {
     }
 }
 
+/// Correction-history bias for the current side to move and recent context.
+///
+/// This combines pawn, non-pawn, and continuation-correction histories. The
+/// result is intentionally a scalar because pruning and reductions use the
+/// magnitude as a confidence signal, not just as an eval offset.
 #[inline]
 pub(super) fn eval_correction(td: &ThreadData, ply: isize) -> i32 {
     let stm = td.board.side_to_move();
@@ -102,6 +119,11 @@ pub(super) fn eval_correction(td: &ThreadData, ply: isize) -> i32 {
         / 73
 }
 
+/// Train correction histories from a quiet, non-check full-width node result.
+///
+/// The caller decides whether the result is trustworthy enough to learn from.
+/// This function only applies the same bonus to the correction tables that
+/// explain the current static-eval context.
 #[inline]
 pub(super) fn update_correction_histories(td: &mut ThreadData, depth: i32, diff: i32, ply: isize) {
     let stm = td.board.side_to_move();

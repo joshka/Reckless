@@ -31,6 +31,11 @@ pub(super) struct TtProbe {
 }
 
 impl TtProbe {
+    /// Read a TT entry and convert absence into neutral search defaults.
+    ///
+    /// The probe starts with the caller's PV status because PV-ness can be
+    /// inherited from the current node even when the table has no entry. A hit
+    /// may then widen that status through the entry's `tt_pv` marker.
     #[inline]
     pub fn read(td: &ThreadData, hash: u64, ply: isize, pv: bool) -> Self {
         let entry = td.shared.tt.read(hash, td.board.halfmove_clock(), ply);
@@ -67,6 +72,11 @@ impl TtProbe {
         }
     }
 
+    /// Whether this TT bound is strong enough to skip full-width search.
+    ///
+    /// This is deliberately stricter than qsearch cutoff logic. It depends on
+    /// node kind, excluded-move verification, stored depth, and cut-node shape;
+    /// changing those guards changes both strength and node counts.
     #[inline]
     pub fn can_cutoff_full_width(
         self, pv: bool, excluded: bool, depth: i32, alpha: i32, beta: i32, cut_node: bool,
@@ -81,6 +91,11 @@ impl TtProbe {
             }
     }
 
+    /// Whether the TT score can replace corrected static eval for pruning.
+    ///
+    /// The bound may only move the estimate in the direction it actually
+    /// proves. This keeps TT information useful for pruning without pretending
+    /// an upper bound is an exact eval.
     #[inline]
     pub fn can_use_score_as_estimate(self, in_check: bool, excluded: bool, eval: i32) -> bool {
         !in_check
@@ -93,6 +108,10 @@ impl TtProbe {
             }
     }
 
+    /// Whether a TT score can stand in for eval at an in-check node.
+    ///
+    /// In-check nodes have no static stand-pat value, so only non-decisive
+    /// scores whose bound is compatible with the current window are usable.
     #[inline]
     pub fn can_use_score_as_in_check_eval(self, alpha: i32, beta: i32) -> bool {
         !is_decisive(self.score)
@@ -104,6 +123,10 @@ impl TtProbe {
             }
     }
 
+    /// Whether a shallow TT qsearch hit proves the current qsearch window.
+    ///
+    /// Qsearch has no depth requirement here, but PV qsearch still rejects
+    /// decisive TT scores so mate-distance-sensitive PV reporting stays sane.
     #[inline]
     pub fn can_cutoff_qsearch(self, pv: bool, alpha: i32, beta: i32) -> bool {
         is_valid(self.score)
@@ -115,6 +138,10 @@ impl TtProbe {
             }
     }
 
+    /// Whether qsearch should use the TT score as its best stand-pat score.
+    ///
+    /// Like full-width eval adjustment, the TT bound may only improve the
+    /// current best score in the direction its bound proves.
     #[inline]
     pub fn can_use_qsearch_score(self, pv: bool, best_score: i32) -> bool {
         is_valid(self.score)

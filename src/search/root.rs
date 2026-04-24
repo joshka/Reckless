@@ -26,6 +26,13 @@ pub enum Report {
     Full,
 }
 
+/// Root alpha-beta window for one MultiPV slot.
+///
+/// Iterative deepening expects most root scores to stay near the previous
+/// iteration. Starting with a narrow window makes the common case cheaper, but
+/// the retry state must carry both `delta` and root depth reduction across
+/// fail-low/fail-high attempts. The caller keeps the retry loop visible because
+/// root sorting and UCI reporting happen between attempts.
 struct AspirationWindow {
     alpha: i32,
     beta: i32,
@@ -64,6 +71,12 @@ impl AspirationWindow {
     }
 }
 
+/// Time-management feedback accumulated across completed root depths.
+///
+/// This is root-only state. It tracks whether the PV, score, and best move are
+/// stable enough to spend less time, or volatile enough to keep searching. It
+/// also owns this thread's soft-stop vote so repeated limit checks do not
+/// double-count votes in shared state.
 struct RootProgress {
     last_best_rootmove: RootMove,
     eval_stability: i32,

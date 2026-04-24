@@ -10,6 +10,11 @@ use crate::{
     types::{ArrayVec, Color, Move, Piece, Square, is_valid},
 };
 
+/// Update histories from the move that won the node and the moves it beat.
+///
+/// This is search feedback, not storage logic. Quiet, noisy, and continuation
+/// histories all learn from the same cutoff event, and the searched move lists
+/// provide maluses for alternatives that were tried before the best move.
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub(super) fn update_best_move_histories(
@@ -64,6 +69,12 @@ pub(super) fn update_best_move_histories(
     }
 }
 
+/// Reward the parent move after an interior fail-low.
+///
+/// A quiet parent that led to an upper-bound child becomes more attractive in
+/// future ordering, especially when it was late, matched the parent TT move, or
+/// made static eval look too optimistic. Noisy parents get only a small direct
+/// history reward.
 #[inline]
 pub(super) fn update_fail_low_parent_history(
     td: &mut ThreadData, ply: isize, depth: i32, in_check: bool, eval: i32, best_score: i32,
@@ -99,6 +110,11 @@ pub(super) fn update_fail_low_parent_history(
     }
 }
 
+/// Apply all post-node history feedback in its required order.
+///
+/// Best-move feedback is always considered first. Parent fail-low feedback only
+/// applies to non-root upper bounds because root nodes do not have a meaningful
+/// parent move to reward.
 #[inline]
 pub(super) fn update_node_histories(
     td: &mut ThreadData, ply: isize, depth: i32, cut_node: bool, node_root: bool, stm: Color, bound: Bound,
@@ -125,6 +141,10 @@ pub(super) fn update_node_histories(
     }
 }
 
+/// Update continuation-history tables for recent parent distances.
+///
+/// The offsets are the continuation-history context depths this engine trains.
+/// The stack entries must already contain `conthist` pointers from make-move.
 #[inline]
 pub(super) fn update_continuation_histories(td: &mut ThreadData, ply: isize, piece: Piece, sq: Square, bonus: i32) {
     for offset in [1, 2, 4, 6] {

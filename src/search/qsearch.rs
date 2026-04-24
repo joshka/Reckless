@@ -18,6 +18,12 @@ use crate::{
 
 use super::{NodeType, eval::eval_correction, make_move, tt, undo_move};
 
+/// Eval state for qsearch's stand-pat contract.
+///
+/// Qsearch only has a static stand-pat value outside check. In check, it must
+/// search evasions and starts from negative infinity. A TT score can adjust the
+/// best stand-pat score, but qsearch keeps the corrected eval separately for
+/// SEE pruning.
 struct QsearchEval {
     raw: i32,
     corrected: i32,
