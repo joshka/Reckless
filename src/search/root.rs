@@ -26,6 +26,138 @@ pub enum Report {
     Full,
 }
 
+struct AspirationWindow {
+    alpha: i32,
+    beta: i32,
+    delta: i32,
+    reduction: i32,
+}
+
+impl AspirationWindow {
+    fn new(average: i32, mut delta: i32, reduction: i32) -> Self {
+        delta += average * average / 25833;
+
+        Self {
+            alpha: (average - delta).max(-Score::INFINITE),
+            beta: (average + delta).min(Score::INFINITE),
+            delta,
+            reduction,
+        }
+    }
+
+    fn search_depth(&self, depth: i32) -> i32 {
+        (depth - self.reduction).max(1)
+    }
+
+    fn fail_low(&mut self, score: i32) {
+        self.beta = (3 * self.alpha + self.beta) / 4;
+        self.alpha = (score - self.delta).max(-Score::INFINITE);
+        self.reduction = 0;
+        self.delta += 28 * self.delta / 128;
+    }
+
+    fn fail_high(&mut self, score: i32) {
+        self.alpha = (self.beta - self.delta).max(self.alpha);
+        self.beta = (score + self.delta).min(Score::INFINITE);
+        self.reduction += 1;
+        self.delta += 62 * self.delta / 128;
+    }
+}
+
+struct RootProgress {
+    last_best_rootmove: RootMove,
+    eval_stability: i32,
+    pv_stability: i32,
+    best_move_changes: usize,
+    soft_stop_voted: bool,
+}
+
+impl RootProgress {
+    fn new() -> Self {
+        Self {
+            last_best_rootmove: RootMove::default(),
+            eval_stability: 0,
+            pv_stability: 0,
+            best_move_changes: 0,
+            soft_stop_voted: false,
+        }
+    }
+
+    fn start_depth(&mut self) {
+        self.best_move_changes /= 2;
+    }
+
+    fn finish_depth(&mut self, td: &mut ThreadData, average_score: i32, thread_count: usize) -> bool {
+        self.update_stability(td, average_score);
+        self.update_last_best_rootmove(td);
+
+        if td.shared.status.get() == Status::STOPPED {
+            return true;
+        }
+
+        self.vote_soft_stop(td, thread_count);
+
+        td.shared.status.get() == Status::STOPPED
+    }
+
+    fn update_stability(&mut self, td: &ThreadData, average_score: i32) {
+        if (td.root_moves[0].score - average_score).abs() < 12 {
+            self.eval_stability += 1;
+        } else {
+            self.eval_stability = 0;
+        }
+
+        if self.last_best_rootmove.mv == td.root_moves[0].mv {
+            self.pv_stability += 1;
+        } else {
+            self.pv_stability = 0;
+        }
+
+        self.best_move_changes += td.best_move_changes;
+    }
+
+    fn update_last_best_rootmove(&mut self, td: &mut ThreadData) {
+        if td.root_moves[0].score != -Score::INFINITE
+            && is_loss(td.root_moves[0].score)
+            && td.shared.status.get() == Status::STOPPED
+        {
+            if let Some(pos) = td.root_moves.iter().position(|rm| rm.mv == self.last_best_rootmove.mv) {
+                td.root_moves.remove(pos);
+                td.root_moves.insert(0, self.last_best_rootmove.clone());
+            }
+        } else {
+            self.last_best_rootmove = td.root_moves[0].clone();
+        }
+    }
+
+    fn vote_soft_stop(&mut self, td: &mut ThreadData, thread_count: usize) {
+        if td.time_manager.soft_limit(td, || self.time_multiplier(td)) {
+            if !self.soft_stop_voted {
+                self.soft_stop_voted = true;
+
+                let votes = td.shared.soft_stop_votes.fetch_add(1, Ordering::AcqRel) + 1;
+                let majority = (thread_count * 65).div_ceil(100);
+                if votes >= majority {
+                    td.shared.status.set(Status::STOPPED);
+                }
+            }
+        } else if self.soft_stop_voted {
+            self.soft_stop_voted = false;
+            td.shared.soft_stop_votes.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    fn time_multiplier(&self, td: &ThreadData) -> f32 {
+        let nodes_factor = (2.7168 - 2.2669 * (td.root_moves[0].nodes as f32 / td.nodes() as f32)).max(0.5630_f32);
+        let pv_stability = (1.25 - 0.05 * self.pv_stability as f32).max(0.85);
+        let eval_stability = (1.2 - 0.04 * self.eval_stability as f32).max(0.88);
+        let score_trend = (0.8 + 0.05 * (td.previous_best_score - td.root_moves[0].score) as f32).clamp(0.80, 1.45);
+        let best_move_stability = 1.0 + self.best_move_changes as f32 / 4.0;
+
+        nodes_factor * pv_stability * eval_stability * score_trend * best_move_stability
+    }
+}
+
 pub fn start(td: &mut ThreadData, report: Report, thread_count: usize) {
     td.completed_depth = 0;
 
@@ -35,12 +167,7 @@ pub fn start(td: &mut ThreadData, report: Report, thread_count: usize) {
     td.multi_pv = td.multi_pv.min(td.root_moves.len());
 
     let mut average = vec![td.previous_best_score; td.multi_pv];
-    let mut last_best_rootmove = RootMove::default();
-
-    let mut eval_stability = 0;
-    let mut pv_stability = 0;
-    let mut best_move_changes = 0;
-    let mut soft_stop_voted = false;
+    let mut progress = RootProgress::new();
 
     // Iterative Deepening
     for depth in 1..MAX_PLY as i32 {
@@ -51,7 +178,7 @@ pub fn start(td: &mut ThreadData, report: Report, thread_count: usize) {
             td.shared.status.set(Status::STOPPED);
             break;
         }
-        best_move_changes /= 2;
+        progress.start_depth();
 
         td.sel_depth = 0;
         td.root_depth = depth;
@@ -70,34 +197,19 @@ pub fn start(td: &mut ThreadData, report: Report, thread_count: usize) {
         for index in 0..td.multi_pv {
             td.pv_index = index;
 
-            if td.pv_index == td.pv_end {
-                td.pv_start = td.pv_end;
-                while td.pv_end < td.root_moves.len() {
-                    if td.root_moves[td.pv_end].tb_rank != td.root_moves[td.pv_start].tb_rank {
-                        break;
-                    }
-                    td.pv_end += 1;
-                }
-            }
+            advance_root_pv_group(td);
 
             // Aspiration Windows
-            delta += average[td.pv_index] * average[td.pv_index] / 25833;
+            let mut window = AspirationWindow::new(average[td.pv_index], delta, reduction);
 
-            let mut alpha = (average[td.pv_index] - delta).max(-Score::INFINITE);
-            let mut beta = (average[td.pv_index] + delta).min(Score::INFINITE);
-
-            let best_avg = ((td.shared.best_stats[td.pv_index].load(Ordering::Acquire) & 0xffff) as i32 - 32768
-                + average[td.pv_index])
-                / 2;
-            td.optimism[td.board.side_to_move()] = 159 * best_avg / (best_avg.abs() + 186);
-            td.optimism[!td.board.side_to_move()] = -td.optimism[td.board.side_to_move()];
+            set_root_optimism(td, average[td.pv_index]);
 
             loop {
                 td.stack = Stack::new();
-                td.root_delta = beta - alpha;
+                td.root_delta = window.beta - window.alpha;
 
                 // Root Search
-                let score = search::<Root>(td, alpha, beta, (depth - reduction).max(1), false, 0);
+                let score = search::<Root>(td, window.alpha, window.beta, window.search_depth(depth), false, 0);
 
                 td.root_moves[td.pv_index..td.pv_end].sort_by_key(|rm| std::cmp::Reverse(rm.score));
 
@@ -106,18 +218,8 @@ pub fn start(td: &mut ThreadData, report: Report, thread_count: usize) {
                 }
 
                 match score {
-                    s if s <= alpha => {
-                        beta = (3 * alpha + beta) / 4;
-                        alpha = (score - delta).max(-Score::INFINITE);
-                        reduction = 0;
-                        delta += 28 * delta / 128;
-                    }
-                    s if s >= beta => {
-                        alpha = (beta - delta).max(alpha);
-                        beta = (score + delta).min(Score::INFINITE);
-                        reduction += 1;
-                        delta += 62 * delta / 128;
-                    }
+                    s if s <= window.alpha => window.fail_low(score),
+                    s if s >= window.beta => window.fail_high(score),
                     _ => {
                         average[td.pv_index] = if average[td.pv_index] == Score::NONE {
                             score
@@ -130,13 +232,18 @@ pub fn start(td: &mut ThreadData, report: Report, thread_count: usize) {
                             Ordering::AcqRel,
                         );
 
+                        delta = window.delta;
+                        reduction = window.reduction;
                         break;
                     }
                 }
 
+                delta = window.delta;
+                reduction = window.reduction;
+
                 td.root_moves[td.pv_start..=td.pv_index].sort_by_key(|rm| std::cmp::Reverse(rm.score));
 
-                if report == Report::Full && td.shared.nodes.aggregate() > 10_000_000 {
+                if should_report_aspiration_retry(td, report) {
                     td.print_uci_info(depth);
                 }
             }
@@ -146,75 +253,11 @@ pub fn start(td: &mut ThreadData, report: Report, thread_count: usize) {
             td.completed_depth = depth;
         }
 
-        if report == Report::Full
-            && !(is_loss(td.root_moves[0].display_score) && td.shared.status.get() == Status::STOPPED)
-            && (td.shared.status.get() == Status::STOPPED
-                || td.pv_index + 1 == td.multi_pv
-                || td.shared.nodes.aggregate() > 10_000_000)
-        {
+        if should_report_depth(td, report) {
             td.print_uci_info(depth);
         }
 
-        if (td.root_moves[0].score - average[td.pv_index]).abs() < 12 {
-            eval_stability += 1;
-        } else {
-            eval_stability = 0;
-        }
-
-        if last_best_rootmove.mv == td.root_moves[0].mv {
-            pv_stability += 1;
-        } else {
-            pv_stability = 0;
-        }
-
-        best_move_changes += td.best_move_changes;
-
-        if td.root_moves[0].score != -Score::INFINITE
-            && is_loss(td.root_moves[0].score)
-            && td.shared.status.get() == Status::STOPPED
-        {
-            if let Some(pos) = td.root_moves.iter().position(|rm| rm.mv == last_best_rootmove.mv) {
-                td.root_moves.remove(pos);
-                td.root_moves.insert(0, last_best_rootmove.clone());
-            }
-        } else {
-            last_best_rootmove = td.root_moves[0].clone();
-        }
-
-        if td.shared.status.get() == Status::STOPPED {
-            break;
-        }
-
-        let multiplier = || {
-            let nodes_factor = (2.7168 - 2.2669 * (td.root_moves[0].nodes as f32 / td.nodes() as f32)).max(0.5630_f32);
-
-            let pv_stability = (1.25 - 0.05 * pv_stability as f32).max(0.85);
-
-            let eval_stability = (1.2 - 0.04 * eval_stability as f32).max(0.88);
-
-            let score_trend = (0.8 + 0.05 * (td.previous_best_score - td.root_moves[0].score) as f32).clamp(0.80, 1.45);
-
-            let best_move_stability = 1.0 + best_move_changes as f32 / 4.0;
-
-            nodes_factor * pv_stability * eval_stability * score_trend * best_move_stability
-        };
-
-        if td.time_manager.soft_limit(td, multiplier) {
-            if !soft_stop_voted {
-                soft_stop_voted = true;
-
-                let votes = td.shared.soft_stop_votes.fetch_add(1, Ordering::AcqRel) + 1;
-                let majority = (thread_count * 65).div_ceil(100);
-                if votes >= majority {
-                    td.shared.status.set(Status::STOPPED);
-                }
-            }
-        } else if soft_stop_voted {
-            soft_stop_voted = false;
-            td.shared.soft_stop_votes.fetch_sub(1, Ordering::AcqRel);
-        }
-
-        if td.shared.status.get() == Status::STOPPED {
+        if progress.finish_depth(td, average[td.pv_index], thread_count) {
             break;
         }
     }
@@ -224,4 +267,38 @@ pub fn start(td: &mut ThreadData, report: Report, thread_count: usize) {
     }
 
     td.previous_best_score = td.root_moves[0].score;
+}
+
+fn advance_root_pv_group(td: &mut ThreadData) {
+    if td.pv_index != td.pv_end {
+        return;
+    }
+
+    td.pv_start = td.pv_end;
+    while td.pv_end < td.root_moves.len() {
+        if td.root_moves[td.pv_end].tb_rank != td.root_moves[td.pv_start].tb_rank {
+            break;
+        }
+        td.pv_end += 1;
+    }
+}
+
+fn set_root_optimism(td: &mut ThreadData, average_score: i32) {
+    let best_avg =
+        ((td.shared.best_stats[td.pv_index].load(Ordering::Acquire) & 0xffff) as i32 - 32768 + average_score) / 2;
+
+    td.optimism[td.board.side_to_move()] = 159 * best_avg / (best_avg.abs() + 186);
+    td.optimism[!td.board.side_to_move()] = -td.optimism[td.board.side_to_move()];
+}
+
+fn should_report_aspiration_retry(td: &ThreadData, report: Report) -> bool {
+    report == Report::Full && td.shared.nodes.aggregate() > 10_000_000
+}
+
+fn should_report_depth(td: &ThreadData, report: Report) -> bool {
+    report == Report::Full
+        && !(is_loss(td.root_moves[0].display_score) && td.shared.status.get() == Status::STOPPED)
+        && (td.shared.status.get() == Status::STOPPED
+            || td.pv_index + 1 == td.multi_pv
+            || td.shared.nodes.aggregate() > 10_000_000)
 }
