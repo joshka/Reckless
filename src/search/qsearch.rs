@@ -16,7 +16,7 @@ use crate::{
     types::{MAX_PLY, Move, Score, draw, is_decisive, is_loss, is_valid, mated_in},
 };
 
-use super::{NodeType, eval_correction, make_move, tt, undo_move};
+use super::{NodeType, eval::eval_correction, make_move, tt, undo_move};
 
 pub(super) fn qsearch<NODE: NodeType>(td: &mut ThreadData, mut alpha: i32, beta: i32, ply: isize) -> i32 {
     debug_assert!(!NODE::ROOT);

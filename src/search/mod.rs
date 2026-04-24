@@ -12,10 +12,9 @@
 use std::sync::atomic::Ordering;
 
 use crate::{
-    evaluation::correct_eval,
     movepick::{MovePicker, Stage},
     thread::{Status, ThreadData},
-    transposition::{Bound, TtDepth},
+    transposition::Bound,
     types::{
         ArrayVec, MAX_PLY, Move, Piece, PieceType, Score, Square, draw, is_decisive, is_loss, is_valid, is_win,
         mate_in, mated_in,
@@ -36,7 +35,7 @@ mod qsearch;
 mod root;
 mod tt;
 
-use eval::{eval_correction, update_correction_histories};
+use eval::{EvalState, update_correction_histories};
 use qsearch::qsearch;
 pub use root::{Report, start};
 
@@ -187,40 +186,13 @@ fn search<NODE: NodeType>(
         }
     }
 
-    let correction_value = eval_correction(td, ply);
-
-    let raw_eval;
-    let mut eval;
-
-    // Evaluation
-    if in_check {
-        raw_eval = Score::NONE;
-        eval = Score::NONE;
-    } else if excluded {
-        raw_eval = Score::NONE;
-        eval = td.stack[ply].eval;
-    } else if is_valid(tt_probe.raw_eval()) {
-        raw_eval = tt_probe.raw_eval();
-        eval = correct_eval(td, raw_eval, correction_value);
-    } else {
-        raw_eval = td.nnue.evaluate(&td.board);
-        eval = correct_eval(td, raw_eval, correction_value);
-
-        td.shared.tt.write(hash, TtDepth::SOME, raw_eval, Score::NONE, Bound::None, Move::NULL, ply, tt_pv, false);
-    }
-
-    // Prefer the TT entry to tighten the evaluation when its bound aligns with
-    // the current alpha-beta window; otherwise, retain the unbounded evaluation
-    let mut estimated_score = eval;
-
-    if tt_probe.can_use_score_as_estimate(in_check, excluded, eval) {
-        estimated_score = tt_probe.score;
-    }
-
-    // Use the bounded TT entry score for evaluation when in check
-    if in_check && tt_probe.can_use_score_as_in_check_eval(alpha, beta) {
-        eval = tt_probe.score;
-    }
+    let eval_state = EvalState::compute(td, hash, ply, in_check, excluded, tt_probe, tt_pv, alpha, beta);
+    let raw_eval = eval_state.raw;
+    let eval = eval_state.corrected;
+    let estimated_score = eval_state.estimated;
+    let correction_value = eval_state.correction;
+    let improvement = eval_state.improvement;
+    let improving = eval_state.improving;
 
     td.stack[ply].eval = eval;
     td.stack[ply].tt_move = tt_probe.mv;
@@ -260,18 +232,6 @@ fn search<NODE: NodeType>(
         && tt_probe.bound != Bound::Upper
         && is_valid(tt_probe.score)
         && !is_decisive(tt_probe.score);
-
-    let improvement = if in_check {
-        0
-    } else if is_valid(td.stack[ply - 2].eval) {
-        eval - td.stack[ply - 2].eval
-    } else if is_valid(td.stack[ply - 4].eval) {
-        eval - td.stack[ply - 4].eval
-    } else {
-        0
-    };
-
-    let improving = improvement > 0;
 
     // Razoring
     if !NODE::PV
