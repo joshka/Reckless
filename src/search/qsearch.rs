@@ -26,7 +26,7 @@ struct QsearchEval {
 }
 
 impl QsearchEval {
-    fn compute<NODE: NodeType>(td: &mut ThreadData, ply: isize, in_check: bool, tt_probe: tt::TtProbe) -> Self {
+    fn compute(td: &mut ThreadData, ply: isize, in_check: bool, node_pv: bool, tt_probe: tt::TtProbe) -> Self {
         let correction = eval_correction(td, ply);
 
         if in_check {
@@ -42,7 +42,7 @@ impl QsearchEval {
         let corrected = correct_eval(td, raw, correction);
         let mut best_score = corrected;
 
-        if tt_probe.can_use_qsearch_score(NODE::PV, best_score) {
+        if tt_probe.can_use_qsearch_score(node_pv, best_score) {
             best_score = tt_probe.score;
         }
 
@@ -95,7 +95,7 @@ pub(super) fn qsearch<NODE: NodeType>(td: &mut ThreadData, mut alpha: i32, beta:
     }
 
     // Evaluation
-    let eval = QsearchEval::compute::<NODE>(td, ply, in_check, tt_probe);
+    let eval = QsearchEval::compute(td, ply, in_check, NODE::PV, tt_probe);
     let raw_eval = eval.raw;
     let correction_value = eval.correction;
     let mut best_score = eval.best_score;

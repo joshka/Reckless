@@ -11,7 +11,7 @@ use crate::{
     types::{Move, Score, is_decisive, is_valid},
 };
 
-use super::{NodeType, NonPV, search, tt::TtProbe};
+use super::{NonPV, search, tt::TtProbe};
 
 #[derive(Copy, Clone)]
 pub(super) struct SingularOutcome {
@@ -27,18 +27,18 @@ impl SingularOutcome {
     }
 }
 
-pub(super) fn search_if_needed<NODE: NodeType>(
-    td: &mut ThreadData, ply: isize, depth: i32, beta: i32, cut_node: bool, excluded: bool, potential: bool,
-    tt_probe: TtProbe, correction: i32,
+pub(super) fn search_if_needed(
+    td: &mut ThreadData, ply: isize, depth: i32, beta: i32, cut_node: bool, node_root: bool, node_pv: bool,
+    excluded: bool, potential: bool, tt_probe: TtProbe, correction: i32,
 ) -> SingularOutcome {
-    if NODE::ROOT || excluded || !potential {
+    if node_root || excluded || !potential {
         return SingularOutcome::none(tt_probe.mv);
     }
 
     debug_assert!(is_valid(tt_probe.score));
 
     let singular_margin = if tt_probe.bound == Bound::Exact { (depth as u32).div_ceil(4) as i32 } else { depth }
-        + depth * (tt_probe.tt_pv && !NODE::PV) as i32;
+        + depth * (tt_probe.tt_pv && !node_pv) as i32;
     let singular_beta = tt_probe.score - singular_margin;
     let singular_depth = (depth - 1) / 2;
 
@@ -55,9 +55,9 @@ pub(super) fn search_if_needed<NODE: NodeType>(
     }
 
     if score < singular_beta {
-        let double_margin = 204 * NODE::PV as i32 - 16 * tt_probe.mv.is_quiet() as i32 - 16 * correction.abs() / 128;
+        let double_margin = 204 * node_pv as i32 - 16 * tt_probe.mv.is_quiet() as i32 - 16 * correction.abs() / 128;
         let triple_margin =
-            257 * NODE::PV as i32 - 16 * tt_probe.mv.is_quiet() as i32 - 15 * correction.abs() / 128 + 32;
+            257 * node_pv as i32 - 16 * tt_probe.mv.is_quiet() as i32 - 15 * correction.abs() / 128 + 32;
 
         let mut extension = 1;
         extension += (score < singular_beta - double_margin) as i32;

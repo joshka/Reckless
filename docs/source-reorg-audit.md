@@ -8,12 +8,26 @@ hot-path performance.
 
 ## Current Shape
 
-`src/search.rs` currently owns root iterative deepening, root result reporting,
-the recursive full-width search, qsearch, search-facing TT policy, static eval
-setup, correction-history policy, pruning gates, singular extensions, move-loop
-mechanics, history updates, and make/undo wrappers. That makes the file useful
-as a behavior reference, but it forces a reader to keep root search, interior
-node search, qsearch, and many update policies in one mental frame.
+`src/search/mod.rs` still owns the recursive full-width search driver and the
+make/undo wrappers. That is intentional for now: the full-width function is the
+hot ordering contract, and the remaining long region is the move loop where
+cross-heuristic experimentation is most valuable. The surrounding phases now
+have named concepts:
+
+- `search/root.rs` owns iterative deepening, MultiPV tablebase-rank groups,
+  aspiration windows, UCI reporting decisions, and root time feedback.
+- `search/tt.rs` owns the search view of TT probes and bound predicates.
+- `search/eval.rs` owns raw eval, corrected eval, TT-adjusted estimates, and
+  correction-history training.
+- `search/pruning.rs` owns pre-move pruning gates.
+- `search/singular.rs` owns singular-extension verification outcomes.
+- `search/history.rs` owns search-side history feedback after a node result.
+- `search/finalize.rs` owns final node-result guards and score shaping.
+- `search/qsearch.rs` owns quiescence search, stand-pat, and tactical pruning.
+
+The result is not a finished “small full search” function, but it is no longer
+only a mechanical file split. Each extracted module names a chess-engine
+concept and the full-width driver now exposes the major phase sequence.
 
 Several adjacent concepts already have separate storage modules:
 
@@ -23,11 +37,12 @@ Several adjacent concepts already have separate storage modules:
 - `src/threadpool.rs` owns worker setup, legal root move generation, and
   thread-level search execution.
 
-The search refactor should keep storage modules stable unless an extraction
-needs a small documentation or visibility adjustment. The first production
-target should be named concepts inside the full-width driver, not a module tree
-by itself. File moves are useful only after the concept boundary has proven that
-it reduces cognitive load.
+The storage modules stayed stable. The useful extractions were concept objects
+and small inline policy helpers rather than broad state managers. The remaining
+high-risk boundary is the move loop: LMP, futility, SEE pruning, LMR/PVS,
+root-move updates, and child-search retry policy still share many locals because
+packing them into one long-lived context struct could increase register
+pressure and hide tuned data flow.
 
 ## Cognitive-Load Problems
 
@@ -35,13 +50,14 @@ The largest problem is that phase boundaries are implicit. A reader must infer
 where TT policy ends, static eval policy begins, and which later pruning or
 history phase depends on fields initialized earlier in the node.
 
-Root and interior responsibilities are interleaved. The same `search` function
-handles root filtering and reporting side effects while also carrying all
-non-root pruning and history policy.
+Root and interior responsibilities are much less interleaved. The root driver
+now names root-only iteration and time-management concepts, while the full-width
+driver still handles root filtering and root-result updates inside the hot move
+loop.
 
-Qsearch is algorithmically distinct but sits after full-width search in the
-same module and shares helpers with no explicit boundary. That makes it easy to
-accidentally move full-width assumptions into qsearch or vice versa.
+Qsearch is now isolated behind its own module contract. It still shares
+make/undo and TT-probe concepts with full-width search, but its stand-pat and
+tactical pruning gates are qsearch-local.
 
 TT, eval, pruning, singular extension, move loop, and post-loop update code all
 share many scalar locals. Some of that is unavoidable in a tuned alpha-beta
@@ -58,19 +74,16 @@ to evaluate early because they shape nearly every proposed helper API.
 
 ## Proposed Module Boundaries
 
-`search/root.rs` should move first. It owns iterative deepening, MultiPV rank
-groups, aspiration windows, root optimism, UCI reporting decisions, soft-stop
-feedback, and the root call into full-width search. This is a real abstraction
-because root search has a different lifecycle and reporting contract from
-interior nodes.
+`search/root.rs` owns iterative deepening, MultiPV rank groups, aspiration
+windows, root optimism, UCI reporting decisions, soft-stop feedback, and the
+root call into full-width search. This is a real abstraction because root search
+has a different lifecycle and reporting contract from interior nodes.
 
-`search/full.rs` should eventually contain the recursive alpha-beta driver and
-the `NodeType` markers. Before that move, the current full-width function should
-grow named local concepts such as `TtProbe`, `EvalState`, `SingularOutcome`,
-and `NodeFinalization`. Once those concepts are clear, `full.rs` should read
-like the phase map: guards, TT/tablebase, eval, pre-move pruning, singular
-extension, move loop, post-loop finalization. This module coordinates concepts;
-it should not hide the phase order behind a generic pipeline.
+`search/full.rs` remains a possible follow-up, but `search/mod.rs` currently
+serves that role. The full-width function now coordinates `TtProbe`,
+`EvalState`, `SingularOutcome`, pruning gates, history feedback, and
+finalization helpers. Moving it to `full.rs` would now be a file-layout change,
+not a conceptual refactor.
 
 `search/tt.rs` should contain search-facing TT policy: probe snapshots, cutoff
 predicates, TT-adjusted eval predicates, early lower-bound write policy, final
@@ -98,10 +111,10 @@ singular-extension result. It is a separate concept because it temporarily
 excludes the TT move, performs a verification search, and can produce an
 extension, multi-cut, TT-move suppression, or negative extension.
 
-`search/moves.rs` should contain make/undo wrappers, node counting, NNUE
-push/pop, continuation pointer setup, TT prefetch, root move filtering, and
-root result updates. This is a real abstraction around move-loop mechanics, not
-move ordering itself.
+`search/moves.rs` is deferred. Make/undo, node counting, NNUE push/pop,
+continuation pointer setup, TT prefetch, root move filtering, and root result
+updates are the riskiest hot-path boundary. They should move only if a follow-up
+can preserve node counts and avoid repeated speed loss.
 
 `search/history.rs` should contain search-side history scoring and update
 policy: quiet/noisy move scores, continuation-history updates, best-move

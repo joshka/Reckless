@@ -364,12 +364,14 @@ fn search<NODE: NodeType>(
         }
     }
 
-    let singular = singular::search_if_needed::<NODE>(
+    let singular = singular::search_if_needed(
         td,
         ply,
         depth,
         beta,
         cut_node,
+        NODE::ROOT,
+        NODE::PV,
         excluded,
         potential_singularity,
         tt_probe,
