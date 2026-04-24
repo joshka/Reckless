@@ -54,23 +54,12 @@ pub(super) fn qsearch<NODE: NodeType>(td: &mut ThreadData, mut alpha: i32, beta:
     }
 
     let hash = td.board.hash();
-    let entry = td.shared.tt.read(hash, td.board.halfmove_clock(), ply);
-
-    let mut tt_move = Move::NULL;
-    let mut tt_score = Score::NONE;
-    let mut tt_bound = Bound::None;
-    let mut tt_pv = NODE::PV;
+    let tt_probe = tt::TtProbe::read(td, hash, ply, NODE::PV);
+    let tt_pv = tt_probe.tt_pv;
 
     // QS early TT cutoff
-    if let Some(entry) = &entry {
-        tt_move = entry.mv;
-        tt_score = entry.score;
-        tt_bound = entry.bound;
-        tt_pv |= entry.tt_pv;
-
-        if tt::can_cutoff_qsearch(NODE::PV, tt_score, tt_bound, alpha, beta) {
-            return tt_score;
-        }
+    if tt_probe.can_cutoff_qsearch(NODE::PV, alpha, beta) {
+        return tt_probe.score;
     }
 
     let raw_eval;
@@ -84,15 +73,12 @@ pub(super) fn qsearch<NODE: NodeType>(td: &mut ThreadData, mut alpha: i32, beta:
         eval = Score::NONE;
         best_score = -Score::INFINITE;
     } else {
-        raw_eval = match &entry {
-            Some(entry) if is_valid(entry.raw_eval) => entry.raw_eval,
-            _ => td.nnue.evaluate(&td.board),
-        };
+        raw_eval = if is_valid(tt_probe.raw_eval()) { tt_probe.raw_eval() } else { td.nnue.evaluate(&td.board) };
         eval = correct_eval(td, raw_eval, correction_value);
         best_score = eval;
 
-        if tt::can_use_qsearch_score(NODE::PV, tt_score, tt_bound, best_score) {
-            best_score = tt_score;
+        if tt_probe.can_use_qsearch_score(NODE::PV, best_score) {
+            best_score = tt_probe.score;
         }
     }
 
@@ -102,7 +88,7 @@ pub(super) fn qsearch<NODE: NodeType>(td: &mut ThreadData, mut alpha: i32, beta:
             best_score = beta + (best_score - beta) / 3;
         }
 
-        if entry.is_none() {
+        if !tt_probe.has_entry() {
             td.shared.tt.write(hash, TtDepth::SOME, raw_eval, best_score, Bound::Lower, Move::NULL, ply, tt_pv, false);
         }
 
@@ -119,7 +105,7 @@ pub(super) fn qsearch<NODE: NodeType>(td: &mut ThreadData, mut alpha: i32, beta:
     let mut move_picker = MovePicker::new_qsearch();
 
     let skip_quiets =
-        |best_score| !((in_check && is_loss(best_score)) || (tt_move.is_quiet() && tt_bound != Bound::Upper));
+        |best_score| !((in_check && is_loss(best_score)) || (tt_probe.mv.is_quiet() && tt_probe.bound != Bound::Upper));
 
     while let Some(mv) = move_picker.next::<NODE>(td, skip_quiets(best_score), ply) {
         move_count += 1;
