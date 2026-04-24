@@ -445,21 +445,21 @@ production changes should make `search::<NODE>` easier to read while keeping
 the function in place.
 
 1. Add module docs and phase-boundary comments to the current files.
-1. Audit every use of `ThreadData` fields inside full-width search and group
+2. Audit every use of `ThreadData` fields inside full-width search and group
    them by concept: board/NNUE, stack, histories, root state, shared state, and
    time state.
-1. Audit every `NODE::ROOT` and `NODE::PV` branch and classify whether it is a
+3. Audit every `NODE::ROOT` and `NODE::PV` branch and classify whether it is a
    root-only entry concern, a PV-window concern, or a codegen concern.
-1. Prototype a non-generic `NodeContext` or `NodeKind` shape in pseudocode, then
+4. Prototype a non-generic `NodeContext` or `NodeKind` shape in pseudocode, then
    benchmark only if the code change remains simple and readable.
-1. Introduce `TtProbe` locally and replace loose TT locals.
-1. Introduce `EvalState` locally and replace loose eval locals.
-1. Introduce `SingularOutcome` and isolate singular-extension decisions.
-1. Name pre-move pruning gates while keeping the order visible in the driver.
-1. Name post-loop finalization before moving it to another module.
-1. Move mature concepts to modules only after they have proven useful in place.
-1. Treat move-loop and make/undo abstractions as optional until speed evidence
-   says they are safe.
+5. Introduce `TtProbe` locally and replace loose TT locals.
+6. Introduce `EvalState` locally and replace loose eval locals.
+7. Introduce `SingularOutcome` and isolate singular-extension decisions.
+8. Name pre-move pruning gates while keeping the order visible in the driver.
+9. Name post-loop finalization before moving it to another module.
+10. Move mature concepts to modules only after they have proven useful in place.
+11. Treat further move-loop and transition abstractions as optional until speed
+   evidence says they are safe.
 
 Every step should preserve deterministic bench nodes. Hot-path extractions
 should be compared against their direct parent with `speedtest 1 16 30`, and

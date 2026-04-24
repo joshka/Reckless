@@ -8,11 +8,10 @@ hot-path performance.
 
 ## Current Shape
 
-`src/search/mod.rs` still owns the recursive full-width search driver and the
-make/undo wrappers. That is intentional for now: the full-width function is the
-hot ordering contract, and the remaining long region is the move loop where
-cross-heuristic experimentation is most valuable. The surrounding phases now
-have named concepts:
+`src/search/mod.rs` is now a module index and node-kind surface. The recursive
+full-width driver lives in `search/full.rs`, and the make/undo transition
+contract lives in `search/transition.rs`. The surrounding phases have named
+concepts:
 
 - `search/root.rs` owns iterative deepening, MultiPV tablebase-rank groups,
   aspiration windows, UCI reporting decisions, and root time feedback.
@@ -23,6 +22,7 @@ have named concepts:
 - `search/singular.rs` owns singular-extension verification outcomes.
 - `search/history.rs` owns search-side history feedback after a node result.
 - `search/finalize.rs` owns final node-result guards and score shaping.
+- `search/transition.rs` owns search-side make/undo transition invariants.
 - `search/qsearch.rs` owns quiescence search, stand-pat, and tactical pruning.
 
 The result is not a finished “small full search” function, but it is no longer
@@ -79,11 +79,10 @@ windows, root optimism, UCI reporting decisions, soft-stop feedback, and the
 root call into full-width search. This is a real abstraction because root search
 has a different lifecycle and reporting contract from interior nodes.
 
-`search/full.rs` remains a possible follow-up, but `search/mod.rs` currently
-serves that role. The full-width function now coordinates `TtProbe`,
-`EvalState`, `SingularOutcome`, pruning gates, history feedback, and
-finalization helpers. Moving it to `full.rs` would now be a file-layout change,
-not a conceptual refactor.
+`search/full.rs` owns the recursive full-width alpha-beta spine. The function
+coordinates `TtProbe`, `EvalState`, `SingularOutcome`, pruning gates, ordered
+move search, history feedback, and finalization helpers while keeping phase
+order visible.
 
 `search/tt.rs` should contain search-facing TT policy: probe snapshots, cutoff
 predicates, TT-adjusted eval predicates, early lower-bound write policy, final
@@ -111,10 +110,12 @@ singular-extension result. It is a separate concept because it temporarily
 excludes the TT move, performs a verification search, and can produce an
 extension, multi-cut, TT-move suppression, or negative extension.
 
-`search/moves.rs` is deferred. Make/undo, node counting, NNUE push/pop,
-continuation pointer setup, TT prefetch, root move filtering, and root result
-updates are the riskiest hot-path boundary. They should move only if a follow-up
-can preserve node counts and avoid repeated speed loss.
+`search/moves.rs` owns ordered child search: move ordering, root filtering,
+candidate pruning, child search, root result updates, alpha-beta transitions,
+and searched-move buffers. Make/undo, node counting, NNUE push/pop,
+continuation pointer setup, and TT prefetch moved to `search/transition.rs` so
+the move loop can show the make/search/undo sequence without owning transition
+mechanics.
 
 `search/history.rs` should contain search-side history scoring and update
 policy: quiet/noisy move scores, continuation-history updates, best-move
@@ -130,20 +131,20 @@ driver.
 
 1. Add module docs and phase-boundary comments that explain ownership,
    invariants, and tuned ordering constraints.
-1. Audit full-width `ThreadData` field usage and group it into smaller state
+2. Audit full-width `ThreadData` field usage and group it into smaller state
    concepts before introducing more helpers that take all of `ThreadData`.
-1. Audit `NODE::ROOT` and `NODE::PV` usage to decide which branches are real
+3. Audit `NODE::ROOT` and `NODE::PV` usage to decide which branches are real
    algorithm distinctions and which only exist for current codegen shape.
-1. Introduce a local `TtProbe` search view before moving TT policy to
+4. Introduce a local `TtProbe` search view before moving TT policy to
    `search/tt.rs`.
-1. Introduce a local `EvalState` before moving eval policy to `search/eval.rs`.
-1. Introduce `SingularOutcome` before moving singular logic to
+5. Introduce a local `EvalState` before moving eval policy to `search/eval.rs`.
+6. Introduce `SingularOutcome` before moving singular logic to
    `search/singular.rs`.
-1. Name pre-move pruning gates while keeping their order visible.
-1. Name post-loop finalization before moving history and TT writeback helpers.
-1. Move root search and qsearch into modules only when their local docs explain
+7. Name pre-move pruning gates while keeping their order visible.
+8. Name post-loop finalization before moving history and TT writeback helpers.
+9. Move root search and qsearch into modules only when their local docs explain
    their algorithmic contracts.
-1. Treat move-loop and make/undo extraction as optional and performance-gated.
+10. Treat further move-loop and transition reshaping as performance-gated.
 
 Each step should be one jj change with one conceptual purpose. If an extraction
 needs visibility changes, keep them in the same change only when the extracted

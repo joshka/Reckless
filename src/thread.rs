@@ -198,6 +198,22 @@ impl ThreadData {
         self.shared.nodes.get(self.id)
     }
 
+    /// Whether shared search control has requested this worker to stop.
+    ///
+    /// Search phases should use this instead of reaching through `shared.status`
+    /// when they only need the stop contract. Thread-pool lifecycle code still
+    /// owns the lower-level RUNNING/STOPPED state transitions.
+    #[inline]
+    pub fn is_stopped(&self) -> bool {
+        self.shared.status.get() == Status::STOPPED
+    }
+
+    /// Request that all workers stop at their next polling point.
+    #[inline]
+    pub fn stop_search(&self) {
+        self.shared.status.set(Status::STOPPED);
+    }
+
     pub fn corrhist(&self) -> &SharedCorrectionHistory {
         &self.corrhist
     }
@@ -211,51 +227,20 @@ impl ThreadData {
         let nps = self.shared.nodes.aggregate() as f64 / elapsed.as_secs_f64();
         let ms = elapsed.as_millis();
 
+        let root_in_tb = self.shared.root_in_tb.load(Ordering::Relaxed);
+
         for pv_index in 0..self.multi_pv {
             let root_move = &self.root_moves[pv_index];
-
-            let updated = root_move.score != -Score::INFINITE;
-
-            if depth == 1 && !updated && pv_index > 0 {
+            let Some(report) = root_move.uci_report(depth, pv_index, root_in_tb) else {
                 continue;
-            }
-
-            let depth = if updated { depth } else { (depth - 1).max(1) };
-            let mut score = if updated { root_move.display_score } else { root_move.previous_score };
-
-            let mut upperbound = root_move.upperbound;
-            let mut lowerbound = root_move.lowerbound;
-
-            if self.shared.root_in_tb.load(Ordering::Relaxed) && score.abs() <= Score::TB_WIN {
-                score = root_move.tb_score;
-                upperbound = false;
-                lowerbound = false;
-            }
-
-            let mut formatted_score = match score.abs() {
-                s if s < Score::TB_WIN_IN_MAX => {
-                    format!("cp {}", normalize_to_cp(score, &self.board))
-                }
-                s if s <= Score::TB_WIN => {
-                    let cp = 20_000 - Score::TB_WIN + score.abs();
-                    format!("cp {}", if score.is_positive() { cp } else { -cp })
-                }
-                _ => {
-                    let mate = (Score::MATE - score.abs() + score.is_positive() as i32) / 2;
-                    format!("mate {}", if score.is_positive() { mate } else { -mate })
-                }
             };
 
-            if upperbound {
-                formatted_score.push_str(" upperbound");
-            } else if lowerbound {
-                formatted_score.push_str(" lowerbound");
-            }
-
             print!(
-                "info depth {depth} seldepth {} multipv {} score {formatted_score} nodes {} time {ms} nps {nps:.0} hashfull {} tbhits {} pv",
+                "info depth {} seldepth {} multipv {} score {} nodes {} time {ms} nps {nps:.0} hashfull {} tbhits {} pv",
+                report.depth,
                 root_move.sel_depth,
                 pv_index + 1,
+                report.formatted_score(&self.board),
                 self.shared.nodes.aggregate(),
                 self.shared.tt.hashfull(),
                 self.shared.tb_hits.aggregate(),
@@ -271,18 +256,44 @@ impl ThreadData {
     }
 }
 
+/// Root-search state for one legal move at ply zero.
+///
+/// This type is intentionally physical rather than perfectly conceptual: root search, tablebase
+/// setup, UCI reporting, and move sorting all mutate the same move list. Treat the field groups as
+/// separate concepts even though they share one cache-friendly record.
 #[derive(Clone)]
 pub struct RootMove {
+    /// Legal root move identity. This is the stable key used by root filtering and reporting.
     pub mv: Move,
+
+    /// Current search score used for root sorting and best-move selection.
     pub score: i32,
+
+    /// Previous completed-depth score, used to preserve root ordering between iterations.
     pub previous_score: i32,
+
+    /// UCI-facing score after root display shaping and aspiration-bound handling.
     pub display_score: i32,
+
+    /// Whether `display_score` should be reported as an upper bound.
     pub upperbound: bool,
+
+    /// Whether `display_score` should be reported as a lower bound.
     pub lowerbound: bool,
+
+    /// Selected depth reached by the root move, reported with the UCI line.
     pub sel_depth: i32,
+
+    /// Node count spent under this root move during the current search.
     pub nodes: u64,
+
+    /// Principal variation currently attached to this root move.
     pub pv: PrincipalVariationTable,
+
+    /// Root tablebase rank used to group MultiPV searches without mixing proven classes.
     pub tb_rank: i32,
+
+    /// Root tablebase score associated with `tb_rank`.
     pub tb_score: i32,
 }
 
@@ -302,6 +313,156 @@ impl Default for RootMove {
             tb_score: 0,
         }
     }
+}
+
+impl RootMove {
+    /// Carry the current score into `previous_score` at the start of a new root depth.
+    pub fn start_depth(&mut self) {
+        self.previous_score = self.score;
+    }
+
+    /// Whether two root moves belong to the same root tablebase rank group.
+    pub fn same_tablebase_group(&self, other: &Self) -> bool {
+        self.tb_rank == other.tb_rank
+    }
+
+    /// Record the UCI-facing result of searching this root move.
+    ///
+    /// This updates the root move's search score, display score, bound flags, selected depth, PV,
+    /// and node accounting together because UCI reporting and root sorting consume them as one
+    /// result concept.
+    pub fn record_search_result(&mut self, result: RootSearchResult<'_>) -> bool {
+        self.nodes += result.nodes;
+
+        if result.move_count != 1 && result.score <= result.alpha {
+            self.mark_unsearched_for_sorting();
+            return false;
+        }
+
+        self.upperbound = false;
+        self.lowerbound = false;
+        match result.score {
+            v if v <= result.alpha => {
+                self.display_score = result.alpha;
+                self.upperbound = true;
+            }
+            v if v >= result.beta => {
+                self.display_score = result.beta;
+                self.lowerbound = true;
+            }
+            _ => {
+                self.display_score = result.score;
+            }
+        }
+
+        self.score = result.score;
+        self.sel_depth = result.sel_depth;
+        self.pv.commit_full_root_pv(result.pv, result.start_ply);
+
+        result.move_count > 1
+    }
+
+    /// Mark this move as not currently competitive for root sorting.
+    pub fn mark_unsearched_for_sorting(&mut self) {
+        self.score = -Score::INFINITE;
+    }
+
+    /// Build the UCI reporting view for this root move.
+    ///
+    /// Root search may report a previous-depth value when a move has not been searched at the
+    /// current depth. Tablebase root mode replaces ordinary search display scores for TB-winning
+    /// values because the root TB rank, not aspiration-window bounds, owns the displayed proof.
+    fn uci_report(&self, depth: i32, pv_index: usize, root_in_tb: bool) -> Option<RootMoveReport> {
+        let updated = self.score != -Score::INFINITE;
+
+        if depth == 1 && !updated && pv_index > 0 {
+            return None;
+        }
+
+        let mut report = RootMoveReport {
+            depth: if updated { depth } else { (depth - 1).max(1) },
+            score: if updated { self.display_score } else { self.previous_score },
+            upperbound: self.upperbound,
+            lowerbound: self.lowerbound,
+        };
+
+        if root_in_tb && report.score.abs() <= Score::TB_WIN {
+            report.score = self.tb_score;
+            report.upperbound = false;
+            report.lowerbound = false;
+        }
+
+        Some(report)
+    }
+}
+
+/// UCI-facing score and bound view for one root move.
+struct RootMoveReport {
+    /// Depth to print for this move.
+    depth: i32,
+
+    /// Score after root display shaping and tablebase replacement.
+    score: i32,
+
+    /// Whether this score is an aspiration upper bound.
+    upperbound: bool,
+
+    /// Whether this score is an aspiration lower bound.
+    lowerbound: bool,
+}
+
+impl RootMoveReport {
+    /// Format the score and optional bound flag for a UCI `info` line.
+    fn formatted_score(&self, board: &Board) -> String {
+        let mut formatted = match self.score.abs() {
+            s if s < Score::TB_WIN_IN_MAX => {
+                format!("cp {}", normalize_to_cp(self.score, board))
+            }
+            s if s <= Score::TB_WIN => {
+                let cp = 20_000 - Score::TB_WIN + self.score.abs();
+                format!("cp {}", if self.score.is_positive() { cp } else { -cp })
+            }
+            _ => {
+                let mate = (Score::MATE - self.score.abs() + self.score.is_positive() as i32) / 2;
+                format!("mate {}", if self.score.is_positive() { mate } else { -mate })
+            }
+        };
+
+        if self.upperbound {
+            formatted.push_str(" upperbound");
+        } else if self.lowerbound {
+            formatted.push_str(" lowerbound");
+        }
+
+        formatted
+    }
+}
+
+/// Root move search result applied after one candidate search.
+pub struct RootSearchResult<'a> {
+    /// Score returned by the root child search.
+    pub score: i32,
+
+    /// Root alpha before accepting this score.
+    pub alpha: i32,
+
+    /// Root beta for display bound shaping.
+    pub beta: i32,
+
+    /// One-based root move count in the ordered move loop.
+    pub move_count: i32,
+
+    /// Selected depth reached while searching this move.
+    pub sel_depth: i32,
+
+    /// Principal variation table to copy from.
+    pub pv: &'a PrincipalVariationTable,
+
+    /// Source ply in `pv` for the root line.
+    pub start_ply: usize,
+
+    /// Nodes spent under this root move during the just-finished child search.
+    pub nodes: u64,
 }
 
 #[derive(Clone)]

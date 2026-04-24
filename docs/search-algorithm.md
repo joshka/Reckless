@@ -1,269 +1,253 @@
 # Search Algorithm Map
 
-This document describes the search as an algorithm. It is intentionally broader
-than the source layout so refactors can preserve the ordering, invariants, and
-tuned behavior that make the engine strong.
+<!-- markdownlint-configure-file {"MD013": {"line_length": 100}} -->
+
+Search runs as nested control loops. `uci::go` prepares limits, `ThreadPool::execute_searches`
+creates worker state, `search::start` drives root [iterative deepening], root search handles
+[MultiPV] and [aspiration window] retries, full-width search evaluates recursive [alpha-beta]
+nodes, and [quiescence search] stabilizes tactical leaves.
+
+Full-width search is the normal recursive node contract. It may consider the whole legal move set,
+although pruning, reductions, extensions, and [PVS] often avoid searching every move to the same
+depth. The full-width contract includes terminal guards, TT and tablebase proofs, static eval,
+pre-move pruning, singular verification, ordered move search, history feedback, TT writeback, and
+correction-history learning.
+
+Qsearch starts when full-width depth reaches zero. It uses a smaller contract: shallow TT policy,
+stand-pat eval outside check, tactical move generation, [SEE] pruning, small history bonuses, and
+shallow TT writeback. Qsearch omits full-width reduction policy, singular search, root reporting,
+ordinary quiet move loops, and full-width correction-history training.
 
 ## Search Lifecycle
 
-The UCI `go` command enters `uci::go`, parses time controls into a
-`TimeManager`, and calls `ThreadPool::execute_searches`. The thread pool
-increments the transposition-table age, resets node and tablebase counters,
-marks shared search status as running, builds legal root moves for the main
-thread, optionally ranks them with Syzygy, then starts one search per worker.
-Helper threads receive the same board and root move list and run without UCI
-reporting.
+The UCI layer parses the `go` command into a `TimeManager`. `ThreadPool::execute_searches` then
+increments TT age, resets shared counters, marks shared status as running, builds legal root moves,
+applies Syzygy root ranking when available, and starts one worker search per thread. Helper workers
+receive the same board and root move list but do not print UCI `info`.
 
-Each worker calls `search::start`. Startup clears the PV table, refreshes NNUE
-for the current root, clips MultiPV to the legal root move count, and
-initializes per-iteration stability trackers. The root search is iterative
-deepening from depth 1 to `MAX_PLY`. For each depth and each MultiPV index, the
-driver chooses the current tablebase-rank group, builds an aspiration window
-around the rolling average score, sets root optimism, resets the stack, and
-calls the recursive full-width search as a root PV node.
+Each worker enters `search::start`. Root startup clears the PV table, refreshes NNUE for the root
+board, clips MultiPV to the legal root move count, and initializes root progress state. The root
+loop searches depths from 1 to `MAX_PLY`. Each depth searches every active MultiPV slot, possibly
+with several aspiration retries, then reports completed-depth information and feeds stability
+signals back into time management.
 
-The recursive full-width search handles all interior alpha-beta nodes. It first
-runs terminal and cheap guard logic, optionally dives to qsearch when depth
-reaches zero, probes TT and tablebases, sets up static evaluation, applies
-pre-move pruning, decides singular extensions, searches ordered moves with
-pruning and reductions, updates PV and alpha-beta state, then writes history,
-correction history, and TT results.
+When workers stop, the main `go` path combines thread results. Timed single-PV search votes across
+worker best moves using score and completed depth. If a helper result wins, the main path prints a
+final `info` line for that result before reporting `bestmove`.
 
-Qsearch is the leaf stabilizer. It searches checks and tactical moves from
-depth-zero positions, uses stand-pat evaluation when not in check, applies
-narrower TT and SEE logic, and writes shallow TT entries. It avoids the
-full-width machinery for depth reductions, singular extensions, large-scale
-quiet history updates, and most pre-move pruning.
+## Root Search
 
-When a worker stops, the main `go` path combines thread results. For normal
-timed single-PV search it votes across worker best moves using score and
-completed depth. It prints a final `info` line if a helper result wins the vote,
-then reports `bestmove`.
+Root search handles ply-zero responsibilities: legal root move groups, MultiPV indexes,
+aspiration windows, root reporting, root tablebase grouping, root optimism, and time feedback.
+Interior nodes do not sort root moves, print UCI output, or vote on soft stops.
 
-## Root Search Responsibilities
+A root depth runs in this order:
 
-Root setup owns the legal root move list. `ThreadPool::execute_searches`
-generates legal moves from the UCI position, stores them as `RootMove` values,
-and copies that list to helpers. With Syzygy enabled, tablebase root ranking
-happens before workers start so the root search can group and report moves by
-tablebase rank.
+1. Stop if the configured depth limit has been exceeded.
+2. Start root progress accounting for this depth.
+3. Reset selected depth, root depth, best-move-change count, and PV rank-group bounds.
+4. Mark every `RootMove` as starting a new depth.
+5. Search each MultiPV slot.
+6. Record completed depth if the shared search was not stopped.
+7. Print depth information when reporting rules allow it.
+8. Feed root stability into time management and possibly stop.
 
-`search::start` owns MultiPV iteration. At each depth it searches PV indexes in
-order, preserving groups of equal tablebase rank with `pv_start` and `pv_end`.
-Root move sorting is restricted to the active rank group or already searched PV
-prefix so MultiPV does not mix tablebase priorities.
+A MultiPV slot search runs in this order:
 
-Aspiration windows are root-only control flow. The window starts around the
-rolling average for the PV index, expands after fail-low or fail-high, and may
-reduce the re-search depth after fail-high.  This feedback loop is sensitive
-because it changes how often the recursive search is called and with which
-alpha-beta shape.
+1. Advance to the current tablebase-rank group.
+2. Build an [aspiration window] around the rolling average score.
+3. Set root optimism from shared best-score statistics.
+4. Reset the stack.
+5. Store root delta for reduction policy.
+6. Search the root as a PV full-width node.
+7. Sort the active root group after each retry.
+8. Expand the aspiration window after fail-low or fail-high.
+9. Report expensive aspiration retries when UCI reporting is enabled.
 
-Root reporting is tied to `RootMove`. During a root node, every searched root
-move accumulates node count, score, bound flags, selected depth, display score,
-and a committed root PV. The iterative driver decides when to print UCI `info`:
-after completed depths, after expensive aspiration re-searches, and for minimal
-reporting at the end.
+`RootMove` is the root result record. A searched root move accumulates node count, score, display
+score, bound flags, selected depth, PV, tablebase rank, tablebase score, and previous score for
+reporting unsearched MultiPV moves. The move loop updates the matching `RootMove` after each root
+candidate; the root driver decides when to sort, group, and report those results.
 
-Time management also feeds back at the root. The driver tracks evaluation
-stability, PV stability, best-move changes, and the node share spent on the
-current best move. Those signals produce the soft limit multiplier. A
-helper-thread vote stops the shared search once enough workers agree that the
-soft limit has been reached.
+Root progress turns search stability into time feedback. It tracks evaluation stability against the
+rolling average, PV stability from repeated best moves, best-move-change count, node share spent on
+the current best move, and this worker's soft-stop vote. Helper votes stop the shared search once
+enough workers agree that the soft limit has been reached.
 
-## Full-Width Node Phases
+## Full-Width Search
 
-Full-width search is ordered to keep cheap, high-probability exits ahead of
-expensive work and to preserve node-count behavior. The current phase order is:
+Full-width search preserves a strict phase order because many exits change node counts, TT
+contents, history feedback, or time behavior. The driver order is:
 
-1. Validate alpha-beta invariants, derive side-to-move, check state, and
-   exclusion state.
-1. Clear PV storage for non-root PV nodes.
-1. Stop immediately if shared status is stopped.
-1. Enter qsearch when depth is zero or below.
-1. Apply upcoming repetition draw adjustment before deeper work.
-1. Update selective depth for PV nodes and poll the time manager on the main
-   thread.
-1. Handle non-root terminal guards: draw detection, maximum ply, and
-   mate-distance pruning.
-1. Probe TT, seed TT move/score/bound/PV state, and take non-PV cutoffs when
-   the entry is deep enough, compatible with the window, and not blocked by
-   exclusion or halfmove-clock safety.
-1. Probe tablebases for eligible non-root nodes and either cut off, seed a PV
-   lower bound, or cap the PV score with a maximum score.
-1. Compute correction-history value, raw static eval, corrected eval, and
-   optionally store a shallow eval-only TT entry.
-1. Tighten estimated score from TT bounds when the bound direction agrees with
-   static eval. In-check nodes may use a compatible non-decisive TT score as
-   eval.
-1. Initialize stack state for this ply, including eval, TT move, TT PV flag,
-   reductions, move count, and the grandchild cutoff counter.
-1. Apply eval-difference quiet-history feedback and hindsight depth changes.
-1. Detect potential singularity from depth, TT depth, TT bound, TT score, and
-   decisive-score guards.
-1. Compute improvement and improving state from prior stack evals.
-1. Run pre-move pruning in tuned order: razoring, reverse futility pruning,
-   null-move pruning with verification, and ProbCut.
-1. Run singular-extension search for the TT move when eligible. The result may
-   extend, multi-cut, suppress the TT move, or apply a negative extension.
-1. Initialize move-loop state: best move, bound, quiet/noisy searched move
-   buffers, move picker, quiet skipping, search-count tracking, alpha-raise
-   count, and TT-move score.
-1. Iterate ordered moves, skipping excluded moves and non-selected root moves.
-1. Score each move with quiet or noisy history and run move pruning: late-move
-   pruning, futility pruning, bad-noisy futility pruning, and SEE pruning.
-1. Make the move, count the node, update stack continuation pointers, push NNUE,
-   update the board, and prefetch the child TT entry.
-1. Choose new depth and run late-move reductions or full-depth reduced scout
-   search according to depth, move count, node type, TT state, history,
-   improvement, prior
-   reductions, helper bias, and singular-margin feedback.
-1. Run PV re-search for PV nodes when the first move or a scout result raises
-   alpha.
-1. Undo the move and stop if shared status changed.
-1. At root, update the matching `RootMove` with node count, bound display state,
-   score, selected
-   depth, PV, and best-move-change accounting.
-1. Update best score, alpha, bound, PV table, early lower-bound TT write,
-   alpha-raise count, and quiet/noisy searched-move buffers.
-1. If there were no legal moves, return mate, draw, or excluded-move tablebase
-   sentinel.
-1. Apply post-loop history updates for the best move, failed quiet/noisy
-   alternatives, continuation histories, prior-move fail-low bonuses, and TT-PV
-   propagation.
-1. Scale non-decisive beta cutoffs, cap Syzygy PV scores, write the final TT
-   entry, update correction history when the static eval was meaningfully wrong,
-   and return `best_score`.
+```text
+enter node
+try TT proof
+try tablebase proof
+compute eval and stack contracts
+try pre-move pruning
+verify singular extension
+search ordered moves
+finalize node result
+```
 
-The stack is a contract between phases. Earlier phases must fill `eval`,
-`tt_move`, `tt_pv`, `move_count`, and reduction state before later pruning,
-reduction, and history phases read them.  Move make/undo must maintain `mv`,
-`piece`, continuation-history pointers, NNUE stack, board state, node counters,
-and TT prefetch ordering.
+Node entry validates the window, captures root/PV and cut-node facts, derives side-to-move and
+check state, clears PV storage for interior PV nodes, returns on shared stop, enters qsearch at
+depth zero, applies repetition adjustment, updates selected depth, polls time on the main thread,
+handles draw and maximum-ply guards, and applies mate-distance pruning.
+
+The proof phase reads the [transposition table] into `TtProbe`. A TT entry can provide a cutoff
+proof, a move-ordering hint, a TT-adjusted eval bound, a PV marker, or singular-verification
+evidence. Full-width TT cutoffs require compatible depth, bound direction, exclusion state, search
+window, node kind, and halfmove-clock safety. Interior [tablebases] can also cut off, seed a PV
+lower bound, or cap a PV score with an upper bound.
+
+Eval setup computes the correction-history value, obtains raw eval from TT or NNUE, stores a
+raw-eval-only TT entry for fresh NNUE results, builds corrected eval, and tightens the estimated
+score from compatible TT bounds. In-check nodes can use compatible non-decisive TT scores as eval
+because they have no static stand-pat value.
+
+Stack preparation publishes the current node contract to later phases. The stack entry receives
+eval, TT move, TT-PV flag, reduction state, move count, and child cutoff counter state before
+pruning, reductions, and history feedback read those fields. This phase also applies
+eval-difference quiet-history feedback, hindsight depth changes, and improvement signals from
+prior stack evals.
+
+Pre-move pruning runs before ordinary move generation:
+
+1. [Razoring].
+2. [Reverse futility pruning].
+3. [Null-move pruning] with verification.
+4. [ProbCut].
+
+Null move and ProbCut run child searches before the move loop. Their make/undo order, TT prefetch,
+stop handling, and TT writes are part of search behavior.
+
+[Singular search] verifies whether the TT move is much better than alternatives by temporarily
+excluding that move and searching a reduced node. The result can extend the TT move, multi-cut the
+node, suppress a misleading TT move, apply a negative extension, or keep a singular score for
+later reduction policy. The stack exclusion move must be restored before normal move ordering
+continues.
+
+The ordered move loop walks move-picker candidates in search order:
+
+1. Skip the singular-excluded move.
+2. At root, skip moves outside the current MultiPV rank group.
+3. Increment the move count and publish it to the stack.
+4. Derive `MoveCandidate`: move, quiet/noisy class, history score, direct-check status.
+5. Apply move pruning:
+   - [late-move pruning];
+   - quiet [futility pruning];
+   - bad-noisy [futility pruning];
+   - [SEE] pruning.
+6. Record the node count before child search for root reporting.
+7. Make the move through `search/transition.rs`.
+8. Search the child with reduced scout, full-depth scout, and PV re-search as needed.
+9. Undo the move.
+10. Stop if shared search status changed.
+11. At root, update the matching `RootMove`.
+12. Accept the child result into alpha-beta state.
+13. Add non-best searched moves to quiet/noisy buffers for later history feedback.
+
+Child search combines [late-move reductions] and [PVS] with engine-specific signals: depth, move
+count, node kind, cut-node shape, TT move, TT depth, TT-PV, TT-move score, quiet/noisy history,
+correction-history value, improvement state, alpha-raise count, parent reduction, helper-thread
+bias, root delta, and singular-score margin. A reduced scout can trigger a full-depth retry, and a
+PV node can re-search when the first move or a scout result raises alpha.
+
+Alpha-beta acceptance records TT-move score, updates best score, raises alpha, updates the PV table
+for interior PV nodes, records beta cutoffs, publishes early TT lower bounds after allowed
+alpha raises, and counts non-decisive alpha raises for reduction policy.
+
+Finalization handles the completed move set. No-legal-move nodes return mate, draw, or the
+excluded-move tablebase sentinel. Searched nodes update best-move [history] bonuses, quiet/noisy
+maluses, continuation histories, prior-move fail-low feedback, TT-PV propagation, beta-cutoff
+score shaping, Syzygy PV caps, final TT writeback, and correction-history learning.
 
 ## Qsearch
 
-Qsearch keeps the alpha-beta contract but narrows the search to tactical
-stabilization. It handles upcoming repetition, PV clearing and selected-depth
-updates, time polling, draw and maximum-ply guards, and a TT probe. Its TT
-cutoff is simpler than full-width search and does not use depth.
+Qsearch keeps alpha-beta semantics but restricts the move set to tactical stabilization. Entry
+handles repetition adjustment, side-to-move and check state, PV state, selected depth, time polling,
+draw and maximum-ply guards, and a shallow TT probe.
 
-When not in check, qsearch evaluates the current position, applies correction
-history, optionally tightens stand-pat with a compatible TT score, and uses
-stand-pat as the initial best score. A stand-pat beta cutoff can write a shallow
-lower-bound TT entry. In-check nodes do not stand pat; they must search evasions
-and return mate if no legal move exists.
+Outside check, qsearch computes correction history, gets raw eval from TT or NNUE, builds corrected
+eval, tightens stand-pat with compatible TT scores, and uses stand-pat as the current best score.
+A stand-pat beta cutoff writes a shallow lower-bound TT entry only when no TT entry existed. In
+check, qsearch has no stand-pat value; it searches evasions and returns mate if no legal move
+exists.
 
-The qsearch move loop uses `MovePicker::new_qsearch`, usually skips quiets,
-stops after late non-checking moves, and applies SEE pruning against the
-stand-pat margin. It recursively calls qsearch rather than full-width search. On
-beta cutoffs it updates a small quiet or noisy history bonus, scales
-non-decisive cutoffs toward beta, and writes a shallow TT bound.
+The tactical loop uses qsearch move ordering, skips quiets when allowed, stops after late
+non-checking moves, applies qsearch [SEE] pruning against the stand-pat margin, makes the move,
+recurses into qsearch, undoes the move, and updates best score, PV, and alpha. A beta cutoff
+applies a small quiet or noisy history bonus, scales non-decisive cutoffs toward beta, and writes
+the final shallow qsearch TT bound.
 
-Qsearch deliberately does not own root reporting, iterative deepening, singular
-extensions, null-move pruning, ProbCut, full LMR formulas, continuation-history
-maluses, or correction-history training from full-width best-score differences.
+## Shared State And Ordering
 
-## Cross-Cutting State
+`ThreadData` is the per-worker search context. Search reads and mutates it as board and NNUE state,
+stack state, root move and PV state, local histories, correction histories, time state, root and
+MultiPV counters, selected and completed depths, null-move verification state, and a handle to
+shared search state. Narrow methods such as `is_stopped`, `stop_search`, and `nodes` name common
+contracts without replacing `ThreadData` with another all-access context.
 
-`ThreadData` is the per-worker search context. It owns the current board, NNUE
-state, stack, root moves, PV table, local quiet/noisy/continuation histories,
-time manager copy, root/MultiPV counters, optimism, selected depth, completed
-depth, null-move verification guard, and previous best score.
+`SharedContext` contains cross-worker state: TT, shared status, sharded node and tablebase
+counters, tablebase probing flags, soft-stop votes, root best-score statistics, NUMA-replicated
+correction histories, and replicated NNUE parameters.
 
-`SharedContext` is the cross-worker state. It owns the TT, search status,
-sharded node and tablebase counters, tablebase probing flags, soft-stop votes,
-root best-score statistics, NUMA-replicated correction histories, and replicated
-NNUE parameters.
+Stack entries connect parent, current, and child phases without allocation. They carry the move and
+piece just made, static eval, singular-exclusion move, TT move, TT-PV flag, cutoff count, move
+count, reduction amount, and continuation-history subtable pointers. Negative indexing uses
+sentinel entries to provide stable history pointers for early plies.
 
-Stack entries connect parent, current, and child phases without allocation. They
-carry the move and piece just made, static eval, singular-exclusion move, TT
-move and TT-PV flag, cutoff count, move count, reduction amount, and raw
-pointers to continuation-history subtables. Negative indexing is intentional:
-sentinel entries provide stable history pointers for early plies.
+TT writes are algorithmic events. Eval-only writes, tablebase proofs, ProbCut lower bounds,
+alpha-raise lower bounds, final full-width results, stand-pat qsearch bounds, and final qsearch
+bounds all feed later pruning or ordering.
 
-The TT is both a pruning source and a move-ordering/eval source. Search code
-depends on bound type, stored depth, TT-PV marker, mate-distance normalization,
-halfmove-clock safety for false TB/mate scores, and replacement behavior. TT
-writes are part of the algorithm, not just caching; early lower-bound writes and
-eval-only writes feed later move ordering and pruning.
+History tables have separate roles. Quiet history orders quiet moves and feeds quiet pruning
+thresholds. Noisy history orders captures and feeds noisy pruning thresholds. Continuation history
+relates a move to prior moves. Correction history trains static eval by pawn, non-pawn, and
+continuation context.
 
-History tables serve different concepts. Quiet and noisy histories order moves
-and drive pruning thresholds. Continuation history connects the current move to
-prior moves. Correction histories train static eval by pawn key, non-pawn keys,
-and continuation context. NNUE provides raw eval and must be pushed and popped
-in exact board-move order.
+Phase order protects strength, speed, and deterministic node counts. Cheap guards, repetition
+handling, qsearch entry, draw detection, mate-distance pruning, and TT cutoffs run before tablebase
+probes, NNUE eval, and move generation. `make_move` increments nodes exactly when search commits to
+a child and before making the board move. Moving counters, prefetches, or early exits across
+make/undo boundaries changes reported nodes and time-management behavior.
 
-The time manager is mostly root and main-thread state. Interior nodes poll only
-on the main thread, while root stability and helper votes decide the soft stop.
-Shared status is checked at several phase boundaries so workers can return
-quickly without corrupting board, NNUE, or stack state.
+Node kind uses const generics so LLVM can remove root, PV, and non-PV branches from specialized
+call paths. Hot helper boundaries preserve that branch shape with inlining and avoid opaque runtime
+dispatch or heap state. Tuned formula docs explain heuristic purpose and branch-order constraints
+rather than each numeric constant.
 
-## Why Ordering Matters
+## Source Map
 
-Search strength and speed depend on phase order. Cheap guards, repetition
-handling, qsearch entry, draw detection, mate-distance pruning, and TT cutoffs
-run before expensive tablebase probes, evaluation, and move generation. Changing
-that order can alter node counts even if returned moves are usually the same.
+`search/mod.rs` defines the module index and node-kind marker surface. `search/root.rs` handles
+root iterative deepening, MultiPV rank groups, aspiration retries, reporting, and time feedback.
+`search/full.rs` coordinates the recursive full-width phase order. `search/qsearch.rs` handles
+tactical leaf stabilization.
 
-Node counting is an invariant of `make_move`: the engine increments nodes
-exactly when it commits to searching a child and before making the board move.
-Deterministic bench equality is therefore a good behavior check for refactors.
-Moving counters, prefetches, or early exits across make/undo boundaries can
-change both reported nodes and time-management behavior.
+The remaining modules own phase mechanics. `search/tt.rs` interprets TT entries for search.
+`search/eval.rs` builds eval and stack contracts. `search/pruning.rs` contains pruning gates and
+move-pruning predicates. `search/singular.rs` verifies TT-move singularity. `search/moves.rs`
+searches ordered children. `search/reductions.rs` computes child-search depth policy.
+`search/transition.rs` owns make/undo transition invariants. `search/history.rs` applies search
+history feedback. `search/finalize.rs` completes full-width node results. `search/tablebase.rs`
+handles interior Syzygy proofs.
 
-Hot-path branch shape matters. Node type is encoded with const generics so root,
-PV, and non-PV branches can be optimized away. Extraction boundaries in
-full-width search should preserve this shape with inlining where needed and
-avoid packaging hot scalar state into opaque heap-allocated or dynamically
-dispatched objects.
-
-Many formulas are tuned together. Their constants should be treated as SPSA
-output unless an experiment intentionally retunes them. Comments should explain
-each formula's heuristic purpose and branch-order constraint rather than
-restating arithmetic constants.
-
-## Candidate Module Map
-
-`search/root.rs` should own iterative deepening, MultiPV rank groups, aspiration
-windows, root UCI reporting decisions, root time-management feedback, and
-root-specific result updates. This is a real concept because root search has
-responsibilities that do not exist at interior nodes.
-
-`search/full.rs` should own the recursive full-width alpha-beta driver and read
-like the node-phase map above. It should coordinate concept helpers but avoid
-hiding the order of major phases.
-
-`search/tt.rs` should own search-facing TT interpretation: probe result shaping,
-cutoff predicates, TT-adjusted eval predicates, early/final write policies, and
-bound helpers. Storage layout remains in `transposition.rs`; search TT policy is
-a separate concept.
-
-`search/eval.rs` should own raw eval setup, correction-history lookup, corrected
-eval, TT-adjusted estimated score, in-check eval fallback, and
-correction-history update policy. It exists because static eval is not just
-`nnue.evaluate`; it is a bundle of TT and correction-history semantics.
-
-`search/pruning.rs` should own pre-move pruning gates and move-pruning
-predicates: razoring, reverse futility, null move, ProbCut coordination,
-late-move pruning, futility pruning, bad-noisy futility, and SEE thresholds.
-These are conceptually pruning decisions, but the hottest call sites may need
-inline predicates rather than a large state object.
-
-`search/singular.rs` should own potential-singularity detection and
-singular-extension outcomes: extension count, multi-cut score, TT-move
-suppression, and negative extension. This phase is a distinct TT-move
-verification search with its own temporary stack exclusion invariant.
-
-`search/moves.rs` should own move-loop mechanics that are not history policy:
-make/undo wrappers, node counting, NNUE push/pop, continuation pointer setup, TT
-prefetch, root-move filtering, and root move result updates.
-
-`search/history.rs` should own search-side history updates and history-derived
-move scores. The history table storage can stay in `src/history.rs`; this module
-should collect the full-width and qsearch update policies that currently sit at
-several distant points in the driver.
-
-`search/qsearch.rs` should own quiescence search. It is an algorithmically
-different search with a stand-pat contract, tactical move set, shallow TT
-policy, and much smaller history footprint.
+[alpha-beta]: https://www.chessprogramming.org/Alpha-Beta
+[aspiration window]: https://www.chessprogramming.org/Aspiration_Windows
+[futility pruning]: https://www.chessprogramming.org/Futility_Pruning
+[history]: https://www.chessprogramming.org/History_Heuristic
+[iterative deepening]: https://www.chessprogramming.org/Iterative_Deepening
+[late-move pruning]: https://www.chessprogramming.org/Futility_Pruning#Move_Count_Based_Pruning
+[late-move reductions]: https://www.chessprogramming.org/Late_Move_Reductions
+[MultiPV]: https://www.chessprogramming.org/Principal_Variation
+[Null-move pruning]: https://www.chessprogramming.org/Null_Move_Pruning
+[ProbCut]: https://www.chessprogramming.org/ProbCut
+[PVS]: https://www.chessprogramming.org/Principal_Variation_Search
+[quiescence search]: https://www.chessprogramming.org/Quiescence_Search
+[Razoring]: https://www.chessprogramming.org/Razoring
+[Reverse futility pruning]: https://www.chessprogramming.org/Reverse_Futility_Pruning
+[SEE]: https://www.chessprogramming.org/Static_Exchange_Evaluation
+[Singular search]: https://www.chessprogramming.org/Singular_Extensions
+[tablebases]: https://www.chessprogramming.org/Endgame_Tablebases
+[transposition table]: https://www.chessprogramming.org/Transposition_Table

@@ -57,3 +57,29 @@ This split suggests two future directions:
 - If replacing `NodeType` with a runtime `NodeKind`, benchmark it directly;
   current monomorphization may be carrying useful codegen.
 - Treat board/NNUE and stack mutation as hot-path contracts.
+
+## Parameter-Shape Audit
+
+Long parameter lists are not all the same smell. In this search code they
+usually mean one of three things:
+
+- A phase is receiving the caller's whole local frame. This should become a
+  named phase input or a conversion method on an existing phase state. Examples:
+  eval setup now receives `EvalInput`, stack publication receives
+  `StackPreparationInput`, and full-width search converts `FullSearchState`
+  into pruning, singular, move-loop, and finalization inputs.
+- A small tuned predicate names a formula boundary. Keeping scalars can be
+  clearer here because the function is the concept, and a one-off wrapper would
+  hide which terms the formula uses. Examples include razoring, ProbCut
+  eligibility, qsearch SEE pruning, TT-PV propagation, and beta-cutoff score
+  shaping.
+- A hot recursive search call is spelling the alpha-beta contract directly.
+  Calls to `search::<NODE>` and `qsearch::<NODE>` intentionally keep
+  `alpha/beta/depth/cut_node/ply` visible because those values define the
+  recursive window and node-count behavior.
+
+Use the following rule when reviewing future extractions: if the same fields
+travel together because they describe a chess-search phase, introduce or reuse a
+concept value; if the fields are the actual terms of a tuned predicate or the
+recursive alpha-beta contract, keep the scalars visible unless a broader concept
+already exists at the call site.
