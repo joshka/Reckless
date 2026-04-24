@@ -1,3 +1,13 @@
+//! Quiescence search.
+//!
+//! Qsearch stabilizes depth-zero leaves by searching tactical continuations
+//! instead of all legal moves. It has a stand-pat contract when not in check, a
+//! shallow TT policy, and a much smaller history footprint than full-width
+//! search.
+//!
+//! Do not pull full-width pruning or reduction assumptions into this module
+//! without making the qsearch-specific contract explicit.
+
 use crate::{
     evaluation::correct_eval,
     movepick::MovePicker,

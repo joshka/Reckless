@@ -1,3 +1,13 @@
+//! Root search and iterative-deepening control.
+//!
+//! Root search owns the parts of search that only exist at ply zero: legal root
+//! move groups, MultiPV slots, aspiration retries, UCI reporting state, and
+//! time-management feedback. It deliberately delegates interior alpha-beta
+//! decisions to the full-width driver.
+//!
+//! Tablebase root rank, root-move sorting, display bounds, and soft-stop voting
+//! are behavioral. Keep their ordering visible when extracting helpers.
+
 use std::sync::atomic::Ordering;
 
 use crate::{

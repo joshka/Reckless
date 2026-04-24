@@ -1,3 +1,10 @@
+//! Search-side static-eval correction policy.
+//!
+//! Static eval in search is NNUE plus correction-history bias plus selected TT
+//! bound information. This module currently owns correction-history lookup and
+//! training; the intended boundary is the full eval state used by pruning,
+//! reductions, and final correction updates.
+
 use crate::{thread::ThreadData, types::Color};
 
 #[inline]

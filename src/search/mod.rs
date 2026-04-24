@@ -1,3 +1,14 @@
+//! Full-width search driver and shared search glue.
+//!
+//! This module owns the recursive alpha-beta search order. The order is part of
+//! the engine's behavior: cheap terminal guards, TT and tablebase probes,
+//! static-eval setup, pre-move pruning, singular extension, move ordering,
+//! child search, history feedback, and TT writeback all feed later phases.
+//!
+//! Keep the phase sequence visible here. Move details into concept modules only
+//! when the extracted concept has a stable chess-search meaning and does not
+//! hide tuned cross-heuristic data flow.
+
 use std::sync::atomic::Ordering;
 
 use crate::{

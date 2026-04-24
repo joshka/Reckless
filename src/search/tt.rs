@@ -1,3 +1,13 @@
+//! Search-facing transposition-table policy.
+//!
+//! TT storage, replacement, and mate-score normalization live in
+//! `transposition`. This module owns how search interprets a probed entry: as a
+//! cutoff proof, move-ordering hint, eval bound, PV marker, or singularity
+//! signal.
+//!
+//! Bound checks are not interchangeable. Callers should choose helpers that
+//! name the role the TT score is playing.
+
 use crate::{transposition::Bound, types::is_valid};
 
 #[inline]
