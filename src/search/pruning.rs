@@ -7,6 +7,7 @@
 
 use crate::{
     board::Board,
+    movepick::Stage,
     types::{PieceType, is_decisive, is_loss, is_valid, is_win},
 };
 
@@ -68,4 +69,44 @@ pub(super) fn can_try_probcut(cut_node: bool, beta: i32, tt: TtProbe, probcut_be
         && !is_win(beta)
         && if is_valid(tt.score) { tt.score >= probcut_beta && !is_decisive(tt.score) } else { eval >= beta }
         && !tt.mv.is_quiet()
+}
+
+#[inline]
+pub(super) fn late_move_prunes(
+    in_check: bool, gives_direct_check: bool, is_quiet: bool, move_count: i32, improvement: i32, depth: i32,
+    history: i32,
+) -> bool {
+    !in_check
+        && !gives_direct_check
+        && is_quiet
+        && move_count >= (3006 + 70 * improvement / 16 + 1455 * depth * depth + 68 * history / 1024) / 1024
+}
+
+#[inline]
+pub(super) fn futility_prune_score(
+    in_check: bool, gives_direct_check: bool, is_quiet: bool, eval: i32, beta: i32, depth: i32, history: i32,
+    alpha: i32,
+) -> Option<i32> {
+    let futility_value = eval + 79 * depth + 64 * history / 1024 + 84 * (eval >= beta) as i32 - 115;
+
+    (!in_check && is_quiet && depth < 15 && futility_value <= alpha && !gives_direct_check).then_some(futility_value)
+}
+
+#[inline]
+pub(super) fn bad_noisy_futility_score(
+    in_check: bool, gives_direct_check: bool, stage: Stage, eval: i32, depth: i32, history: i32, alpha: i32,
+) -> Option<i32> {
+    let noisy_futility_value = eval + 71 * depth + 68 * history / 1024 + 23;
+
+    (!in_check && depth < 11 && stage == Stage::BadNoisy && noisy_futility_value <= alpha && !gives_direct_check)
+        .then_some(noisy_futility_value)
+}
+
+#[inline]
+pub(super) fn see_threshold(is_quiet: bool, depth: i32, history: i32) -> i32 {
+    if is_quiet {
+        (-17 * depth * depth + 52 * depth - 21 * history / 1024 + 20).min(0)
+    } else {
+        (-8 * depth * depth - 36 * depth - 32 * history / 1024 + 11).min(0)
+    }
 }

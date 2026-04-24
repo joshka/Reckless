@@ -32,6 +32,7 @@ mod finalize;
 mod history;
 mod pruning;
 mod qsearch;
+mod reductions;
 mod root;
 mod singular;
 mod tt;
@@ -40,6 +41,7 @@ use eval::{EvalState, update_correction_histories};
 use finalize::{propagate_tt_pv, scale_beta_cutoff_score, should_update_correction_history, should_write_tt};
 use history::{update_continuation_histories, update_node_histories};
 use qsearch::qsearch;
+use reductions::ReductionContext;
 pub use root::{Report, start};
 
 pub trait NodeType {
@@ -420,20 +422,26 @@ fn search<NODE: NodeType>(
         };
 
         if !NODE::ROOT && !is_loss(best_score) {
+            let gives_direct_check = td.board.is_direct_check(mv);
+
             // Late Move Pruning (LMP)
-            if !in_check
-                && !td.board.is_direct_check(mv)
-                && is_quiet
-                && move_count >= (3006 + 70 * improvement / 16 + 1455 * depth * depth + 68 * history / 1024) / 1024
-            {
+            if pruning::late_move_prunes(
+                in_check,
+                gives_direct_check,
+                is_quiet,
+                move_count,
+                improvement,
+                depth,
+                history,
+            ) {
                 skip_quiets = true;
                 continue;
             }
 
             // Futility Pruning (FP)
-            let futility_value = eval + 79 * depth + 64 * history / 1024 + 84 * (eval >= beta) as i32 - 115;
-
-            if !in_check && is_quiet && depth < 15 && futility_value <= alpha && !td.board.is_direct_check(mv) {
+            if let Some(futility_value) =
+                pruning::futility_prune_score(in_check, gives_direct_check, is_quiet, eval, beta, depth, history, alpha)
+            {
                 if !is_decisive(best_score) && best_score < futility_value {
                     best_score = futility_value;
                 }
@@ -442,14 +450,15 @@ fn search<NODE: NodeType>(
             }
 
             // Bad Noisy Futility Pruning (BNFP)
-            let noisy_futility_value = eval + 71 * depth + 68 * history / 1024 + 23;
-
-            if !in_check
-                && depth < 11
-                && move_picker.stage() == Stage::BadNoisy
-                && noisy_futility_value <= alpha
-                && !td.board.is_direct_check(mv)
-            {
+            if let Some(noisy_futility_value) = pruning::bad_noisy_futility_score(
+                in_check,
+                gives_direct_check,
+                move_picker.stage(),
+                eval,
+                depth,
+                history,
+                alpha,
+            ) {
                 if !is_decisive(best_score) && best_score < noisy_futility_value {
                     best_score = noisy_futility_value;
                 }
@@ -457,11 +466,7 @@ fn search<NODE: NodeType>(
             }
 
             // Static Exchange Evaluation Pruning (SEE Pruning)
-            let threshold = if is_quiet {
-                (-17 * depth * depth + 52 * depth - 21 * history / 1024 + 20).min(0)
-            } else {
-                (-8 * depth * depth - 36 * depth - 32 * history / 1024 + 11).min(0)
-            };
+            let threshold = pruning::see_threshold(is_quiet, depth, history);
 
             if !td.board.see(mv, threshold) {
                 continue;
@@ -474,66 +479,31 @@ fn search<NODE: NodeType>(
 
         let mut new_depth = depth - 1 + if move_count == 1 { extension } else { (extension > 0) as i32 };
         let mut score = Score::ZERO;
+        let reduction_context = ReductionContext {
+            depth,
+            move_count,
+            alpha,
+            beta,
+            correction: correction_value,
+            alpha_raises,
+            tt_probe,
+            tt_pv,
+            cut_node,
+            improving,
+            improvement,
+            child_cutoff_count: td.stack[ply + 1].cutoff_count,
+            tt_move_score,
+            singular_score,
+            parent_reduction: if NODE::PV { 0 } else { td.stack[ply - 1].reduction },
+            helper_bias: helper_reduction_bias(td),
+            root_delta: td.root_delta,
+            node_pv: NODE::PV,
+        };
 
         // Late Move Reductions (LMR)
         if depth >= 2 && move_count >= 2 {
-            let mut reduction = 225 * (move_count.ilog2() * depth.ilog2()) as i32;
-
-            reduction -= 68 * move_count;
-            reduction -= 3297 * correction_value.abs() / 1024;
-            reduction += 1306 * alpha_raises;
-
-            reduction += 546 * (is_valid(tt_probe.score) && tt_probe.score <= alpha) as i32;
-            reduction += 322 * (is_valid(tt_probe.score) && tt_probe.depth < depth) as i32;
-
-            if is_quiet {
-                reduction += 1806;
-                reduction -= 166 * history / 1024;
-            } else {
-                reduction += 1449;
-                reduction -= 109 * history / 1024;
-            }
-
-            if NODE::PV {
-                reduction -= 424 + 433 * (beta - alpha) / td.root_delta;
-            }
-
-            if tt_pv {
-                reduction -= 361;
-                reduction -= 636 * (is_valid(tt_probe.score) && tt_probe.score > alpha) as i32;
-                reduction -= 830 * (is_valid(tt_probe.score) && tt_probe.depth >= depth) as i32;
-            }
-
-            if !tt_pv && cut_node {
-                reduction += 1818;
-                reduction += 2118 * tt_probe.mv.is_null() as i32;
-            }
-
-            if !improving {
-                reduction += (430 - 263 * improvement / 128).min(1096);
-            }
-
-            if td.board.in_check() {
-                reduction -= 1021;
-            }
-
-            if td.stack[ply + 1].cutoff_count > 2 {
-                reduction += 1515;
-            }
-
-            if is_valid(tt_move_score) && is_valid(singular_score) {
-                let margin = tt_move_score - singular_score;
-                reduction += (512 * (margin - 160) / 128).clamp(0, 2048);
-            }
-
-            if !NODE::PV && td.stack[ply - 1].reduction > reduction + 485 {
-                reduction += 129;
-            }
-
-            reduction += helper_reduction_bias(td);
-
-            let reduced_depth =
-                (new_depth - reduction / 1024).clamp(1, new_depth + (move_count <= 3) as i32 + 1) + 2 * NODE::PV as i32;
+            let reduction = reduction_context.late_move_reduction(is_quiet, history, td.board.in_check());
+            let reduced_depth = reduction_context.late_move_reduced_depth(new_depth, reduction);
 
             td.stack[ply].reduction = reduction;
             score = -search::<NonPV>(td, -alpha - 1, -alpha, reduced_depth, true, ply + 1);
@@ -555,53 +525,8 @@ fn search<NODE: NodeType>(
         }
         // Full Depth Search (FDS)
         else if !NODE::PV || move_count >= 2 {
-            let mut reduction = 232 * (move_count.ilog2() * depth.ilog2()) as i32;
-
-            reduction -= 48 * move_count;
-            reduction -= 2408 * correction_value.abs() / 1024;
-
-            if is_quiet {
-                reduction += 1429;
-                reduction -= 152 * history / 1024;
-            } else {
-                reduction += 1053;
-                reduction -= 67 * history / 1024;
-            }
-
-            if tt_pv {
-                reduction -= 936;
-                reduction -= 1080 * (is_valid(tt_probe.score) && tt_probe.depth >= depth) as i32;
-            }
-
-            if !tt_pv && cut_node {
-                reduction += 1543;
-                reduction += 2058 * tt_probe.mv.is_null() as i32;
-            }
-
-            if !improving {
-                reduction += (409 - 254 * improvement / 128).min(1488);
-            }
-
-            if td.stack[ply + 1].cutoff_count > 2 {
-                reduction += 1360;
-            }
-
-            if is_valid(tt_move_score) && is_valid(singular_score) {
-                let margin = tt_move_score - singular_score;
-                reduction += (400 * (margin - 160) / 128).clamp(0, 2048);
-            }
-
-            if mv == tt_probe.mv {
-                reduction -= 3281;
-            }
-
-            if !NODE::PV && td.stack[ply - 1].reduction > reduction + 562 {
-                reduction += 130;
-            }
-
-            reduction += helper_reduction_bias(td);
-
-            let reduced_depth = new_depth - (reduction >= 2864) as i32 - (reduction >= 5585) as i32;
+            let reduction = reduction_context.full_depth_reduction(mv, is_quiet, history);
+            let reduced_depth = reduction_context.full_depth_reduced_depth(new_depth, reduction);
 
             score = -search::<NonPV>(td, -alpha - 1, -alpha, reduced_depth, !cut_node, ply + 1);
             current_search_count += 1;
