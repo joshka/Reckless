@@ -15,9 +15,7 @@ use crate::{
     movepick::{MovePicker, Stage},
     thread::{Status, ThreadData},
     transposition::Bound,
-    types::{
-        ArrayVec, MAX_PLY, Move, Piece, Score, Square, draw, is_decisive, is_loss, is_valid, is_win, mate_in, mated_in,
-    },
+    types::{ArrayVec, MAX_PLY, Move, Piece, Score, draw, is_decisive, is_loss, is_valid, is_win, mate_in, mated_in},
 };
 
 #[cfg(feature = "syzygy")]
@@ -30,6 +28,8 @@ use crate::{
 use crate::misc::{dbg_hit, dbg_stats};
 
 mod eval;
+mod finalize;
+mod history;
 mod pruning;
 mod qsearch;
 mod root;
@@ -37,6 +37,8 @@ mod singular;
 mod tt;
 
 use eval::{EvalState, update_correction_histories};
+use finalize::{propagate_tt_pv, scale_beta_cutoff_score, should_update_correction_history, should_write_tt};
+use history::{update_continuation_histories, update_node_histories};
 use qsearch::qsearch;
 pub use root::{Report, start};
 
@@ -704,103 +706,38 @@ fn search<NODE: NodeType>(
         return if in_check { mated_in(ply) } else { draw(td) };
     }
 
-    if best_move.is_present() {
-        let noisy_bonus = (115 * depth).min(778) - 50 - 77 * cut_node as i32;
-        let noisy_malus = (176 * depth).min(1343) - 51 - 21 * noisy_moves.len() as i32;
+    update_node_histories(
+        td,
+        ply,
+        depth,
+        cut_node,
+        NODE::ROOT,
+        stm,
+        bound,
+        best_move,
+        best_score,
+        beta,
+        current_search_count,
+        &quiet_moves,
+        &noisy_moves,
+        in_check,
+        eval,
+    );
 
-        let quiet_bonus = (172 * depth).min(1508) - 76 - 55 * cut_node as i32;
-        let quiet_malus = (156 * depth).min(1065) - 45 - 36 * quiet_moves.len() as i32;
-
-        let cont_bonus = (99 * depth).min(995) - 65 - 49 * cut_node as i32;
-        let cont_malus = (371 * depth).min(914) - 44 - 18 * quiet_moves.len() as i32;
-
-        if best_move.is_noisy() {
-            td.noisy_history.update(
-                td.board.all_threats(),
-                td.board.moved_piece(best_move),
-                best_move.to(),
-                td.board.type_on(best_move.to()),
-                noisy_bonus,
-            );
-        } else {
-            td.quiet_history.update(td.board.all_threats(), stm, best_move, quiet_bonus);
-            update_continuation_histories(td, ply, td.board.moved_piece(best_move), best_move.to(), cont_bonus);
-
-            for &mv in quiet_moves.iter() {
-                td.quiet_history.update(td.board.all_threats(), stm, mv, -quiet_malus);
-                update_continuation_histories(td, ply, td.board.moved_piece(mv), mv.to(), -cont_malus);
-            }
-        }
-
-        for &mv in noisy_moves.iter() {
-            let captured = td.board.type_on(mv.to());
-            td.noisy_history.update(td.board.all_threats(), td.board.moved_piece(mv), mv.to(), captured, -noisy_malus);
-        }
-
-        if !NODE::ROOT && td.stack[ply - 1].mv.is_quiet() && td.stack[ply - 1].move_count < 2 {
-            let malus = (90 * depth - 58).min(789);
-            update_continuation_histories(td, ply - 1, td.stack[ply - 1].piece, td.stack[ply - 1].mv.to(), -malus);
-        }
-
-        if current_search_count > 1 && best_move.is_quiet() && best_score >= beta {
-            let bonus = (194 * depth - 89).min(1595);
-            update_continuation_histories(td, ply, td.stack[ply].piece, best_move.to(), bonus);
-        }
-    }
-
-    if !NODE::ROOT && bound == Bound::Upper {
-        let prior_move = td.stack[ply - 1].mv;
-        if prior_move.is_quiet() {
-            let factor = 116
-                + 202 * (td.stack[ply - 1].move_count > 7) as i32
-                + 116 * (prior_move == td.stack[ply - 1].tt_move) as i32
-                + 138 * (!in_check && best_score <= eval - 93) as i32
-                + 321 * (is_valid(td.stack[ply - 1].eval) && best_score <= -td.stack[ply - 1].eval - 128) as i32;
-
-            let scaled_bonus = factor * (165 * depth - 35).min(2467) / 128;
-
-            td.quiet_history.update(td.board.prior_threats(), !stm, prior_move, scaled_bonus);
-
-            let entry = &td.stack[ply - 2];
-            if entry.mv.is_present() {
-                let bonus = (159 * depth - 39).min(1160);
-                td.continuation_history.update(entry.conthist, td.stack[ply - 1].piece, prior_move.to(), bonus);
-            }
-        } else if prior_move.is_noisy() {
-            let captured = td.board.captured_piece().unwrap_or_default().piece_type();
-            let bonus = 60;
-
-            td.noisy_history.update(
-                td.board.prior_threats(),
-                td.board.piece_on(prior_move.to()),
-                prior_move.to(),
-                captured,
-                bonus,
-            );
-        }
-    }
-
-    tt_pv |= !NODE::ROOT && bound == Bound::Upper && move_count > 2 && td.stack[ply - 1].tt_pv;
-
-    if !NODE::ROOT && best_score >= beta && !is_decisive(best_score) && !is_decisive(alpha) {
-        let weight = depth.min(8);
-        best_score = (best_score * weight + beta) / (weight + 1);
-    }
+    let parent_tt_pv = !NODE::ROOT && td.stack[ply - 1].tt_pv;
+    tt_pv = propagate_tt_pv(tt_pv, NODE::ROOT, bound, move_count, parent_tt_pv);
+    best_score = scale_beta_cutoff_score(best_score, NODE::ROOT, beta, alpha, depth);
 
     #[cfg(feature = "syzygy")]
     if NODE::PV {
         best_score = best_score.min(max_score);
     }
 
-    if !(excluded || NODE::ROOT && td.pv_index > 0) {
+    if should_write_tt(excluded, NODE::ROOT, td.pv_index) {
         td.shared.tt.write(hash, depth, raw_eval, best_score, bound, best_move, ply, tt_pv, NODE::PV);
     }
 
-    if !(in_check
-        || best_move.is_noisy()
-        || (bound == Bound::Upper && best_score >= eval)
-        || (bound == Bound::Lower && best_score <= eval))
-    {
+    if should_update_correction_history(in_check, best_move, bound, best_score, eval) {
         update_correction_histories(td, depth, best_score - eval, ply);
     }
 
@@ -808,15 +745,6 @@ fn search<NODE: NodeType>(
     debug_assert!(-Score::INFINITE < best_score && best_score < Score::INFINITE);
 
     best_score
-}
-
-fn update_continuation_histories(td: &mut ThreadData, ply: isize, piece: Piece, sq: Square, bonus: i32) {
-    for offset in [1, 2, 4, 6] {
-        let entry = &td.stack[ply - offset];
-        if entry.mv.is_present() {
-            td.continuation_history.update(entry.conthist, piece, sq, bonus);
-        }
-    }
 }
 
 fn helper_reduction_bias(td: &ThreadData) -> i32 {
