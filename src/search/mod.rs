@@ -16,8 +16,7 @@ use crate::{
     thread::{Status, ThreadData},
     transposition::Bound,
     types::{
-        ArrayVec, MAX_PLY, Move, Piece, PieceType, Score, Square, draw, is_decisive, is_loss, is_valid, is_win,
-        mate_in, mated_in,
+        ArrayVec, MAX_PLY, Move, Piece, Score, Square, draw, is_decisive, is_loss, is_valid, is_win, mate_in, mated_in,
     },
 };
 
@@ -31,6 +30,7 @@ use crate::{
 use crate::misc::{dbg_hit, dbg_stats};
 
 mod eval;
+mod pruning;
 mod qsearch;
 mod root;
 mod singular;
@@ -235,53 +235,42 @@ fn search<NODE: NodeType>(
         && !is_decisive(tt_probe.score);
 
     // Razoring
-    if !NODE::PV
-        && !in_check
-        && estimated_score < alpha - 295 - 261 * depth * depth
-        && alpha < 2048
-        && !tt_probe.mv.is_quiet()
-        && tt_probe.bound != Bound::Lower
-    {
+    if pruning::can_razor(NODE::PV, in_check, estimated_score, alpha, depth, tt_probe) {
         return qsearch::<NonPV>(td, alpha, beta, ply);
     }
 
     // Reverse Futility Pruning (RFP)
-    if !tt_pv
-        && !in_check
-        && !excluded
-        && estimated_score
-            >= beta
-                + (1165 * depth * depth / 128 - (80 * improving as i32)
-                    + 25 * depth
-                    + 560 * correction_value.abs() / 1024
-                    - 59 * (td.board.all_threats() & td.board.colors(stm)).is_empty() as i32
-                    + 30)
-                    .max(0)
-        && !is_loss(beta)
-        && !is_win(estimated_score)
-    {
-        return beta + (estimated_score - beta) / 3;
+    if let Some(score) = pruning::reverse_futility_score(
+        tt_pv,
+        in_check,
+        excluded,
+        estimated_score,
+        beta,
+        depth,
+        improving,
+        correction_value,
+        (td.board.all_threats() & td.board.colors(stm)).is_empty(),
+    ) {
+        return score;
     }
 
     // Null Move Pruning (NMP)
-    if cut_node
-        && !in_check
-        && !excluded
-        && !potential_singularity
-        && estimated_score
-            >= beta
-                + (-8 * depth + 116 * tt_pv as i32
-                    - 106 * improvement / 1024
-                    - 20 * (td.stack[ply + 1].cutoff_count < 2) as i32
-                    + 304)
-                    .max(0)
-        && ply as i32 >= td.nmp_min_ply
-        && td.board.material() > 600
-        && !is_loss(beta)
-        && !(tt_probe.bound == Bound::Lower
-            && tt_probe.mv.is_capture()
-            && td.board.piece_on(tt_probe.mv.to()).value() >= PieceType::Knight.value())
-    {
+    if pruning::can_try_null_move(
+        &td.board,
+        cut_node,
+        in_check,
+        excluded,
+        potential_singularity,
+        estimated_score,
+        beta,
+        depth,
+        tt_pv,
+        improvement,
+        td.stack[ply + 1].cutoff_count,
+        ply,
+        td.nmp_min_ply,
+        tt_probe,
+    ) {
         debug_assert_ne!(td.stack[ply - 1].mv, Move::NULL);
 
         let r = (5335 + 260 * depth + 493 * (estimated_score - beta).clamp(0, 1003) / 128) / 1024;
@@ -324,15 +313,7 @@ fn search<NODE: NodeType>(
     // ProbCut
     let mut probcut_beta = beta + 270 - 75 * improving as i32;
 
-    if cut_node
-        && !is_win(beta)
-        && if is_valid(tt_probe.score) {
-            tt_probe.score >= probcut_beta && !is_decisive(tt_probe.score)
-        } else {
-            eval >= beta
-        }
-        && !tt_probe.mv.is_quiet()
-    {
+    if pruning::can_try_probcut(cut_node, beta, tt_probe, probcut_beta, eval) {
         let mut move_picker = MovePicker::new_probcut(probcut_beta - eval);
 
         while let Some(mv) = move_picker.next::<NODE>(td, true, ply) {
