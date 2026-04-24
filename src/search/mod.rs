@@ -33,6 +33,7 @@ use crate::misc::{dbg_hit, dbg_stats};
 mod eval;
 mod qsearch;
 mod root;
+mod singular;
 mod tt;
 
 use eval::{EvalState, update_correction_histories};
@@ -380,48 +381,23 @@ fn search<NODE: NodeType>(
         }
     }
 
-    // Singular Extensions (SE)
-    let mut extension = 0;
-    let mut singular_score = Score::NONE;
-
-    if !NODE::ROOT && !excluded && potential_singularity {
-        debug_assert!(is_valid(tt_probe.score));
-
-        let singular_margin = if tt_probe.bound == Bound::Exact { (depth as u32).div_ceil(4) as i32 } else { depth }
-            + depth * (tt_pv && !NODE::PV) as i32;
-        let singular_beta = tt_probe.score - singular_margin;
-        let singular_depth = (depth - 1) / 2;
-
-        td.stack[ply].excluded = tt_probe.mv;
-        td.stack[ply].mv = Move::NULL;
-        singular_score = search::<NonPV>(td, singular_beta - 1, singular_beta, singular_depth, cut_node, ply);
-        td.stack[ply].excluded = Move::NULL;
-
-        if td.shared.status.get() == Status::STOPPED {
-            return Score::ZERO;
-        }
-
-        if singular_score < singular_beta {
-            let double_margin =
-                204 * NODE::PV as i32 - 16 * tt_probe.mv.is_quiet() as i32 - 16 * correction_value.abs() / 128;
-            let triple_margin =
-                257 * NODE::PV as i32 - 16 * tt_probe.mv.is_quiet() as i32 - 15 * correction_value.abs() / 128 + 32;
-
-            extension = 1;
-            extension += (singular_score < singular_beta - double_margin) as i32;
-            extension += (singular_score < singular_beta - triple_margin) as i32;
-        }
-        // Multi-Cut
-        else if singular_score >= beta && !is_decisive(singular_score) {
-            return (2 * singular_score + beta) / 3;
-        } else if singular_score > tt_probe.score && td.stack[ply].mv != Move::NULL {
-            tt_probe.mv = Move::NULL;
-        }
-        // Negative Extensions
-        else if tt_probe.score >= beta || cut_node {
-            extension = -2;
-        }
+    let singular = singular::search_if_needed::<NODE>(
+        td,
+        ply,
+        depth,
+        beta,
+        cut_node,
+        excluded,
+        potential_singularity,
+        tt_probe,
+        correction_value,
+    );
+    if let Some(score) = singular.cutoff {
+        return score;
     }
+    let extension = singular.extension;
+    let singular_score = singular.score;
+    tt_probe.mv = singular.tt_move;
 
     let mut best_move = Move::NULL;
     let mut bound = Bound::Upper;
