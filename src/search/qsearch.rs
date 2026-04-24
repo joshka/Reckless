@@ -18,6 +18,38 @@ use crate::{
 
 use super::{NodeType, eval::eval_correction, make_move, tt, undo_move};
 
+struct QsearchEval {
+    raw: i32,
+    corrected: i32,
+    best_score: i32,
+    correction: i32,
+}
+
+impl QsearchEval {
+    fn compute<NODE: NodeType>(td: &mut ThreadData, ply: isize, in_check: bool, tt_probe: tt::TtProbe) -> Self {
+        let correction = eval_correction(td, ply);
+
+        if in_check {
+            return Self {
+                raw: Score::NONE,
+                corrected: Score::NONE,
+                best_score: -Score::INFINITE,
+                correction,
+            };
+        }
+
+        let raw = if is_valid(tt_probe.raw_eval()) { tt_probe.raw_eval() } else { td.nnue.evaluate(&td.board) };
+        let corrected = correct_eval(td, raw, correction);
+        let mut best_score = corrected;
+
+        if tt_probe.can_use_qsearch_score(NODE::PV, best_score) {
+            best_score = tt_probe.score;
+        }
+
+        Self { raw, corrected, best_score, correction }
+    }
+}
+
 pub(super) fn qsearch<NODE: NodeType>(td: &mut ThreadData, mut alpha: i32, beta: i32, ply: isize) -> i32 {
     debug_assert!(!NODE::ROOT);
     debug_assert!(ply as usize <= MAX_PLY);
@@ -62,31 +94,15 @@ pub(super) fn qsearch<NODE: NodeType>(td: &mut ThreadData, mut alpha: i32, beta:
         return tt_probe.score;
     }
 
-    let raw_eval;
-    let eval;
-    let mut best_score;
-    let correction_value = eval_correction(td, ply);
-
     // Evaluation
-    if in_check {
-        raw_eval = Score::NONE;
-        eval = Score::NONE;
-        best_score = -Score::INFINITE;
-    } else {
-        raw_eval = if is_valid(tt_probe.raw_eval()) { tt_probe.raw_eval() } else { td.nnue.evaluate(&td.board) };
-        eval = correct_eval(td, raw_eval, correction_value);
-        best_score = eval;
-
-        if tt_probe.can_use_qsearch_score(NODE::PV, best_score) {
-            best_score = tt_probe.score;
-        }
-    }
+    let eval = QsearchEval::compute::<NODE>(td, ply, in_check, tt_probe);
+    let raw_eval = eval.raw;
+    let correction_value = eval.correction;
+    let mut best_score = eval.best_score;
 
     // Stand Pat
     if best_score >= beta {
-        if !is_decisive(best_score) && !is_decisive(beta) {
-            best_score = beta + (best_score - beta) / 3;
-        }
+        best_score = stand_pat_cutoff_score(best_score, beta);
 
         if !tt_probe.has_entry() {
             td.shared.tt.write(hash, TtDepth::SOME, raw_eval, best_score, Bound::Lower, Move::NULL, ply, tt_pv, false);
@@ -104,22 +120,17 @@ pub(super) fn qsearch<NODE: NodeType>(td: &mut ThreadData, mut alpha: i32, beta:
     let mut move_count = 0;
     let mut move_picker = MovePicker::new_qsearch();
 
-    let skip_quiets =
-        |best_score| !((in_check && is_loss(best_score)) || (tt_probe.mv.is_quiet() && tt_probe.bound != Bound::Upper));
+    let skip_quiets = |best_score| qsearch_skips_quiets(in_check, best_score, tt_probe);
 
     while let Some(mv) = move_picker.next::<NODE>(td, skip_quiets(best_score), ply) {
         move_count += 1;
 
-        if !is_loss(best_score) {
-            // Late Move Pruning (LMP)
-            if move_count >= 3 && !td.board.is_direct_check(mv) {
-                break;
-            }
+        if late_move_prunes(td, mv, move_count, best_score) {
+            break;
+        }
 
-            // Static Exchange Evaluation Pruning (SEE Pruning)
-            if is_valid(eval) && !td.board.see(mv, (alpha - eval) / 8 - correction_value.abs().min(64) - 79) {
-                continue;
-            }
+        if see_prunes(td, mv, alpha, eval.corrected, correction_value, best_score) {
+            continue;
         }
 
         make_move(td, ply, mv);
@@ -170,8 +181,8 @@ pub(super) fn qsearch<NODE: NodeType>(td: &mut ThreadData, mut alpha: i32, beta:
         }
     }
 
-    if best_score >= beta && !is_decisive(best_score) && !is_decisive(beta) {
-        best_score = (best_score + beta) / 2;
+    if best_score >= beta {
+        best_score = beta_cutoff_score(best_score, beta);
     }
 
     let bound = if best_score >= beta { Bound::Lower } else { Bound::Upper };
@@ -182,4 +193,37 @@ pub(super) fn qsearch<NODE: NodeType>(td: &mut ThreadData, mut alpha: i32, beta:
     debug_assert!(-Score::INFINITE < best_score && best_score < Score::INFINITE);
 
     best_score
+}
+
+#[inline]
+fn stand_pat_cutoff_score(best_score: i32, beta: i32) -> i32 {
+    if is_decisive(best_score) || is_decisive(beta) {
+        return best_score;
+    }
+
+    beta + (best_score - beta) / 3
+}
+
+#[inline]
+fn qsearch_skips_quiets(in_check: bool, best_score: i32, tt_probe: tt::TtProbe) -> bool {
+    !((in_check && is_loss(best_score)) || (tt_probe.mv.is_quiet() && tt_probe.bound != Bound::Upper))
+}
+
+#[inline]
+fn late_move_prunes(td: &ThreadData, mv: Move, move_count: i32, best_score: i32) -> bool {
+    !is_loss(best_score) && move_count >= 3 && !td.board.is_direct_check(mv)
+}
+
+#[inline]
+fn see_prunes(td: &ThreadData, mv: Move, alpha: i32, eval: i32, correction: i32, best_score: i32) -> bool {
+    !is_loss(best_score) && is_valid(eval) && !td.board.see(mv, (alpha - eval) / 8 - correction.abs().min(64) - 79)
+}
+
+#[inline]
+fn beta_cutoff_score(best_score: i32, beta: i32) -> i32 {
+    if is_decisive(best_score) || is_decisive(beta) {
+        return best_score;
+    }
+
+    (best_score + beta) / 2
 }
