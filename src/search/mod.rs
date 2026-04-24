@@ -21,6 +21,7 @@ use crate::{
 use crate::misc::{dbg_hit, dbg_stats};
 
 mod root;
+mod tt;
 
 pub use root::{Report, start};
 
@@ -130,16 +131,7 @@ fn search<NODE: NodeType>(
         tt_bound = entry.bound;
         tt_pv |= entry.tt_pv;
 
-        if !NODE::PV
-            && !excluded
-            && tt_depth > depth - (tt_score < beta) as i32
-            && is_valid(tt_score)
-            && match tt_bound {
-                Bound::Upper => tt_score <= alpha && (!cut_node || depth > 5),
-                Bound::Lower => tt_score >= beta && (cut_node || depth > 5),
-                _ => true,
-            }
-        {
+        if tt::can_cutoff_full_width(NODE::PV, excluded, tt_depth, depth, tt_score, tt_bound, alpha, beta, cut_node) {
             if tt_move.is_quiet() && tt_score >= beta && td.stack[ply - 1].move_count < 4 {
                 let quiet_bonus = (175 * depth - 79).min(1637);
                 let cont_bonus = (114 * depth - 57).min(1284);
@@ -217,28 +209,12 @@ fn search<NODE: NodeType>(
     // the current alpha-beta window; otherwise, retain the unbounded evaluation
     let mut estimated_score = eval;
 
-    if !in_check
-        && !excluded
-        && is_valid(tt_score)
-        && match tt_bound {
-            Bound::Upper => tt_score < eval,
-            Bound::Lower => tt_score > eval,
-            _ => true,
-        }
-    {
+    if tt::can_use_score_as_estimate(in_check, excluded, tt_score, tt_bound, eval) {
         estimated_score = tt_score;
     }
 
     // Use the bounded TT entry score for evaluation when in check
-    if in_check
-        && !is_decisive(tt_score)
-        && is_valid(tt_score)
-        && match tt_bound {
-            Bound::Upper => tt_score <= alpha,
-            Bound::Lower => tt_score >= beta,
-            _ => true,
-        }
-    {
+    if in_check && tt::can_use_score_as_in_check_eval(tt_score, tt_bound, alpha, beta) {
         eval = tt_score;
     }
 
@@ -959,14 +935,7 @@ fn qsearch<NODE: NodeType>(td: &mut ThreadData, mut alpha: i32, beta: i32, ply: 
         tt_bound = entry.bound;
         tt_pv |= entry.tt_pv;
 
-        if is_valid(tt_score)
-            && (!NODE::PV || !is_decisive(tt_score))
-            && match tt_bound {
-                Bound::Upper => tt_score <= alpha,
-                Bound::Lower => tt_score >= beta,
-                _ => true,
-            }
-        {
+        if tt::can_cutoff_qsearch(NODE::PV, tt_score, tt_bound, alpha, beta) {
             return tt_score;
         }
     }
@@ -989,14 +958,7 @@ fn qsearch<NODE: NodeType>(td: &mut ThreadData, mut alpha: i32, beta: i32, ply: 
         eval = correct_eval(td, raw_eval, correction_value);
         best_score = eval;
 
-        if is_valid(tt_score)
-            && (!NODE::PV || !is_decisive(tt_score))
-            && match tt_bound {
-                Bound::Upper => tt_score < best_score,
-                Bound::Lower => tt_score > best_score,
-                _ => true,
-            }
-        {
+        if tt::can_use_qsearch_score(NODE::PV, tt_score, tt_bound, best_score) {
             best_score = tt_score;
         }
     }
